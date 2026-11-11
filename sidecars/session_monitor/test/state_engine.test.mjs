@@ -745,3 +745,123 @@ test('evaluateConversationHealth detects manual cancel during model thinking bef
   assert.match(hCanceledRound7.headline, /思考已手动终止/);
 });
 
+test('parseTranscript & evaluateConversationHealth track /compact pending state and clear immediately on Revert (撤回)', () => {
+  const t0 = Date.parse('2026-11-11T17:38:55Z');
+  const baseSteps = [
+    JSON.stringify({
+      step_index: 0,
+      type: 'USER_INPUT',
+      created_at: '2026-11-11T10:00:00Z',
+      content: '<USER_REQUEST>\n实现会话监控插件\n</USER_REQUEST>',
+    }),
+    JSON.stringify({
+      step_index: 1290,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-11T17:18:28Z',
+      input_tokens: 2100,
+      cache_read_tokens: 246428,
+      output_tokens: 286,
+      content: '已经移好并同步更新完软链',
+    }),
+  ];
+
+  const compactSteps = [
+    ...baseSteps,
+    JSON.stringify({
+      step_index: 1291,
+      source: 'USER_EXPLICIT',
+      type: 'USER_INPUT',
+      status: 'DONE',
+      created_at: '2026-11-11T17:38:55Z',
+      content: '<USER_REQUEST>\n/compact \n</USER_REQUEST>',
+    }),
+    JSON.stringify({
+      step_index: 1292,
+      source: 'SYSTEM',
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      created_at: '2026-11-11T17:38:56Z',
+      content: '<SYSTEM_MESSAGE>Notice</SYSTEM_MESSAGE>',
+    }),
+  ].join('\n');
+
+  const hookCompacting = {
+    phase: 'thinking',
+    stop: null,
+    turnStartedAt: t0 + 973,
+    invocationStartedAt: t0 + 973,
+    invocationNum: 0,
+    initialNumSteps: 1291,
+  };
+  const rtRunning = {
+    liveStepCount: 1293,
+    cascadeStatus: 'CASCADE_RUN_STATUS_RUNNING',
+    notFullyIdle: true,
+    lastModifiedMs: t0 + 1_000,
+  };
+
+  // 1) While /compact is running: isCompactPending is true and headline indicates compaction
+  const trCompacting = parseTranscript(compactSteps, t0 + 1_000, hookCompacting, rtRunning);
+  assert.equal(trCompacting.isCompactPending, true);
+  assert.equal(trCompacting.titleCandidate, '实现会话监控插件');
+  const hCompacting = evaluateConversationHealth({
+    now: t0 + 5_000,
+    hookState: hookCompacting,
+    transcript: trCompacting,
+    runtimeMeta: rtRunning,
+  });
+  assert.equal(hCompacting.state, 'THINKING');
+  assert.match(hCompacting.headline, /正在压缩历史上下文/);
+
+  // 2) User clicks Revert (撤回) on /compact: SQLite drops liveStepCount back to 1291
+  const rtReverted = {
+    liveStepCount: 1291,
+    cascadeStatus: 'CASCADE_RUN_STATUS_IDLE',
+    notFullyIdle: false,
+    lastModifiedMs: t0 + 12_000,
+  };
+  const trReverted = parseTranscript(compactSteps, t0 + 1_000, hookCompacting, rtReverted);
+  assert.equal(trReverted.isCompactPending, false);
+  assert.equal(trReverted.revertedTailSteps, 2);
+  const hReverted = evaluateConversationHealth({
+    now: t0 + 13_000,
+    hookState: hookCompacting,
+    transcript: trReverted,
+    runtimeMeta: rtReverted,
+  });
+  assert.equal(hReverted.state, 'IDLE');
+  assert.equal(hReverted.badge, '已撤回');
+
+  // 3) When /compact finishes normally with CHECKPOINT: isCompactPending clears and headline reports completion
+  const completedSteps = [
+    compactSteps,
+    JSON.stringify({
+      step_index: 1293,
+      source: 'SYSTEM',
+      type: 'CHECKPOINT',
+      status: 'DONE',
+      created_at: '2026-11-11T17:39:20Z',
+      content: '# Resuming from a compaction',
+    }),
+  ].join('\n');
+  const rtCompleted = {
+    liveStepCount: 1294,
+    cascadeStatus: 'CASCADE_RUN_STATUS_IDLE',
+    notFullyIdle: false,
+    lastModifiedMs: t0 + 25_000,
+  };
+  const trDone = parseTranscript(completedSteps, t0 + 25_000, hookCompacting, rtCompleted);
+  assert.equal(trDone.isCompactPending, false);
+  assert.equal(trDone.turnIdleByTranscript, true);
+  assert.equal(trDone.compactCount, 1);
+  const hDone = evaluateConversationHealth({
+    now: t0 + 26_000,
+    hookState: hookCompacting,
+    transcript: trDone,
+    runtimeMeta: rtCompleted,
+  });
+  assert.equal(hDone.state, 'COMPLETED');
+  assert.equal(hDone.badge, '已完成');
+  assert.match(hDone.headline, /已完成上下文压缩/);
+});
+

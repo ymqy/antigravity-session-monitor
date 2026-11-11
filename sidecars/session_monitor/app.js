@@ -32,6 +32,10 @@
     idleSessionsExpanded: false,
     compactingConvId: '',
     compactingBaselineCount: 0,
+    compactingBaselineReverts: 0,
+    compactingMaxSteps: 0,
+    compactingSawRunning: false,
+    compactingSubmittedAtMs: 0,
     compactingUntilMs: 0,
   };
 
@@ -261,25 +265,49 @@
       tok.subagentOutput ? `子代理输出：${tok.subagentOutput.toLocaleString()} t` : '',
     ].filter(Boolean).join('\n');
 
-    // 检查手动触发的压缩是否已经落盘完成（CHECKPOINT 计数增加）
-    if (
-      state.compactingConvId
-      && state.compactingConvId === cur.conversationId
-      && compactCount > state.compactingBaselineCount
-    ) {
+    // 检查手动触发的压缩是否已完成，或已被用户撤回 / 手动停止
+    const clearCompactingState = () => {
       state.compactingConvId = '';
+      state.compactingBaselineReverts = 0;
+      state.compactingSawRunning = false;
+      state.compactingSubmittedAtMs = 0;
+      state.compactingMaxSteps = 0;
       state.compactingUntilMs = 0;
-      showToast('上下文压缩已完成');
+    };
+    if (state.compactingConvId && state.compactingConvId === cur.conversationId) {
+      const curSteps = cur.stepCount || 0;
+      const curReverts = cur.revertedStepsTotal || 0;
+      if (curSteps > state.compactingMaxSteps) {
+        state.compactingMaxSteps = curSteps;
+      }
+      if (isLive || cur.isCompacting) {
+        state.compactingSawRunning = true;
+      }
+      const revertedNow = (state.compactingMaxSteps > 0 && curSteps < state.compactingMaxSteps)
+        || curReverts > state.compactingBaselineReverts;
+      const stoppedAfterStart = !isLive && !cur.isCompacting && (
+        state.compactingSawRunning
+        || revertedNow
+        || h.state === 'ERROR_STOPPED'
+        || (state.compactingSubmittedAtMs > 0 && Date.now() - state.compactingSubmittedAtMs >= 2500)
+      );
+
+      if (compactCount > state.compactingBaselineCount) {
+        clearCompactingState();
+        showToast('上下文压缩已完成');
+      } else if (revertedNow || stoppedAfterStart || Date.now() > state.compactingUntilMs) {
+        clearCompactingState();
+      }
     } else if (state.compactingConvId && Date.now() > state.compactingUntilMs) {
-      state.compactingConvId = '';
-      state.compactingUntilMs = 0;
+      clearCompactingState();
     }
 
     // 轻量压缩操作角标（核心指标：当前上下文 Token 占用量；手动点击直接触发压缩，绝不后台自动代执行）
     const ch = cur.compactHint;
     const compactBadge = $('compact-badge');
     const isCompactingHere = Boolean(
-      state.compactingConvId && state.compactingConvId === cur.conversationId && Date.now() <= state.compactingUntilMs,
+      cur.isCompacting
+      || (state.compactingConvId && state.compactingConvId === cur.conversationId && Date.now() <= state.compactingUntilMs),
     );
     if (isCompactingHere) {
       compactBadge.textContent = '压缩中…';
@@ -814,9 +842,22 @@
     $('compact-badge').blur();
     document.activeElement?.blur?.();
 
+    const resetCompacting = () => {
+      state.compactingConvId = '';
+      state.compactingBaselineReverts = 0;
+      state.compactingSawRunning = false;
+      state.compactingSubmittedAtMs = 0;
+      state.compactingMaxSteps = 0;
+      state.compactingUntilMs = 0;
+    };
+
     state.compactingConvId = cid || cur.conversationId || '';
     state.compactingBaselineCount = cur.compactCount || 0;
-    state.compactingUntilMs = Date.now() + 45_000;
+    state.compactingBaselineReverts = cur.revertedStepsTotal || 0;
+    state.compactingMaxSteps = cur.stepCount || 0;
+    state.compactingSawRunning = false;
+    state.compactingSubmittedAtMs = 0;
+    state.compactingUntilMs = Date.now() + 60_000;
     renderAll();
 
     try {
@@ -831,16 +872,15 @@
         workspaceName: cur.workspaceName || '',
       });
       if (res?.ok) {
+        state.compactingSubmittedAtMs = Date.now();
         showToast(res.alreadyCompacting ? '当前会话正在压缩中' : '已触发上下文压缩（约 15～30s 完成）');
       } else {
-        state.compactingConvId = '';
-        state.compactingUntilMs = 0;
+        resetCompacting();
         renderAll();
         showToast(res?.reason || '触发压缩失败');
       }
     } catch (err) {
-      state.compactingConvId = '';
-      state.compactingUntilMs = 0;
+      resetCompacting();
       renderAll();
       showToast(`触发失败：${err.message || '网络异常'}`);
     }

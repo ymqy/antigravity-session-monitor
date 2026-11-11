@@ -651,6 +651,11 @@ function buildConversationSnapshot(convId, psRows, now) {
     userSettings,
   );
 
+  const isCompacting = Boolean(
+    tr.isCompactPending && ['THINKING', 'THINKING_DEEP', 'RETRYING'].includes(health.state),
+  );
+  const revertedStepsTotal = (tr.rolledBackSteps || 0) + (tr.revertedTailSteps || 0);
+
   const cpuBucket = proc ? Math.round(proc.cpu) : -1;
   const etagPart = [
     convId,
@@ -663,6 +668,8 @@ function buildConversationSnapshot(convId, psRows, now) {
     tr.tokenSpeed.latestTps ?? '-',
     activeSubagentTpsSum,
     compactHint?.level ?? '-',
+    isCompacting ? 1 : 0,
+    revertedStepsTotal,
     title,
     subagents.map((s) => s.key).join(','),
   ].join('|');
@@ -689,6 +696,8 @@ function buildConversationSnapshot(convId, psRows, now) {
     stepCount: tr.stepCount,
     stepsSinceCompact: tr.stepsSinceCompact,
     compactCount: tr.compactCount,
+    isCompacting,
+    revertedStepsTotal,
     compactHint,
     avgThinkingSec: tr.avgThinkingMs ? Math.max(1, Math.round(tr.avgThinkingMs / 1000)) : null,
     tokenSpeed: {

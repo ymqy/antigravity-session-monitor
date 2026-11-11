@@ -495,6 +495,7 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null, r
     stepsSinceCompact: 0,
     compactCount: 0,
     lastCompactAtMs: null,
+    isCompactPending: false,
     rolledBackSteps: 0,
     revertedTailSteps: 0,
     titleCandidate: '',
@@ -585,6 +586,7 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null, r
   let titleCandidate = '';
   let turnStartedAtMs = null;
   let lastUserStepIdx = -1;
+  let lastUserPrompt = '';
   let lastCompactIdx = -1;
   let compactCount = 0;
   let lastCompactAtMs = null;
@@ -629,11 +631,13 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null, r
 
     if (st.type === 'USER_INPUT') {
       const promptText = extractUserPrompt(st.content);
-      if (promptText && (!titleCandidate || (titleCandidate.length < 6 && promptText.length >= 6))) {
+      const isSlashCompact = /^\/compact(?:\s|$)/i.test(promptText);
+      if (promptText && !isSlashCompact && (!titleCandidate || (titleCandidate.length < 6 && promptText.length >= 6))) {
         titleCandidate = promptText;
       }
       turnStartedAtMs = stMs || transcriptMtimeMs || Date.now();
       lastUserStepIdx = i;
+      lastUserPrompt = promptText || '';
       continue;
     }
 
@@ -943,8 +947,13 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null, r
     lastPlannerRound && lastPlannerRound.tools.length === 0 && lastStepObj.type === 'PLANNER_RESPONSE',
   );
 
+  const isManualCompactTurn = lastUserStepIdx >= 0 && /^\/compact(?:\s|$)/i.test(lastUserPrompt);
+  const isCompactPending = isManualCompactTurn && lastCompactIdx < lastUserStepIdx;
+
   let turnIdleByTranscript = false;
   if (lastStepObj.type === 'PLANNER_RESPONSE' && (!Array.isArray(lastStepObj.tool_calls) || lastStepObj.tool_calls.length === 0)) {
+    turnIdleByTranscript = true;
+  } else if (isManualCompactTurn && lastStepObj.type === 'CHECKPOINT') {
     turnIdleByTranscript = true;
   } else if (lastPlannerRound && pendingTools.length === 0) {
     const hasSwarmWaitDone = lastPlannerRound.tools.some((t) => t.name === 'swarm_wait' && t.status === 'DONE');
@@ -1003,6 +1012,7 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null, r
     stepsSinceCompact,
     compactCount,
     lastCompactAtMs,
+    isCompactPending,
     rolledBackSteps,
     revertedTailSteps,
     titleCandidate,
@@ -1162,16 +1172,20 @@ export function evaluateConversationHealth({
           alertKey: `waiting-artifact-${tr.stepCount}`,
         };
       }
+      const lastRoundInTurn = tr.rounds[tr.rounds.length - 1];
       const lastToolRoundInTurn = [...tr.rounds]
         .reverse()
         .find((r) => r.kind === 'planner' && r.inCurrentTurn && r.tools?.length > 0);
+      const completedSummary = (lastRoundInTurn?.kind === 'compact' && lastRoundInTurn.inCurrentTurn)
+        ? lastRoundInTurn.title
+        : (lastToolRoundInTurn?.tools?.[0]?.label
+          ? `最近操作：${lastToolRoundInTurn.tools[0].label}`
+          : '本轮执行已正常结束，等待新指令');
       return {
         state: 'COMPLETED',
         badge: '已完成',
         severity: 'idle',
-        headline: lastToolRoundInTurn?.tools?.[0]?.label
-          ? `最近操作：${lastToolRoundInTurn.tools[0].label}`
-          : '本轮执行已正常结束，等待新指令',
+        headline: completedSummary,
         detail: '',
         elapsedSec: 0,
         startedAtMs: stopTs,
@@ -1437,12 +1451,15 @@ export function evaluateConversationHealth({
       : 0;
     const isCanceled = reason === 'USER_CANCELED';
 
+    const lastRoundInTurn = tr.rounds[tr.rounds.length - 1];
     const lastToolRoundInTurn = [...tr.rounds]
       .reverse()
       .find((r) => r.kind === 'planner' && r.inCurrentTurn && r.tools?.length > 0);
-    const completedSummary = lastToolRoundInTurn?.tools?.[0]?.label
-      ? `最近操作：${lastToolRoundInTurn.tools[0].label}`
-      : '本轮执行已正常结束，等待新指令';
+    const completedSummary = (lastRoundInTurn?.kind === 'compact' && lastRoundInTurn.inCurrentTurn)
+      ? lastRoundInTurn.title
+      : (lastToolRoundInTurn?.tools?.[0]?.label
+        ? `最近操作：${lastToolRoundInTurn.tools[0].label}`
+        : '本轮执行已正常结束，等待新指令');
 
     return {
       state: isCanceled ? 'IDLE' : 'COMPLETED',
@@ -1540,7 +1557,9 @@ export function evaluateConversationHealth({
         state: 'THINKING_DEEP',
         badge: '深度推理中',
         severity: 'caution',
-        headline: `模型正在深度长思考（第 ${invocationNum || 1} 轮）`,
+        headline: tr.isCompactPending
+          ? '正在深度压缩长会话历史上下文…'
+          : `模型正在深度长思考（第 ${invocationNum || 1} 轮）`,
         detail: `${modelName ? `${modelName} · ` : ''}高推理模型处理复杂架构拆解耗时 1～3 分钟属正常现象`,
         elapsedSec,
         startedAtMs: thinkStart,
@@ -1556,7 +1575,9 @@ export function evaluateConversationHealth({
       state: 'THINKING',
       badge: '模型思考中',
       severity: 'healthy',
-      headline: `正在思考与规划（第 ${invocationNum || 1} 轮）`,
+      headline: tr.isCompactPending
+        ? '正在压缩历史上下文并生成检查点摘要…'
+        : `正在思考与规划（第 ${invocationNum || 1} 轮）`,
       detail: `${modelName ? `${modelName} · ` : ''}${avgHint}`,
       elapsedSec,
       startedAtMs: thinkStart,
