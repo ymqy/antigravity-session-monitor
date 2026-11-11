@@ -199,7 +199,8 @@ export function thinkingHeading(thinking) {
 
 export function parseIsoMs(s) {
   if (!s || typeof s !== 'string') return null;
-  const ms = Date.parse(s.trim());
+  const norm = s.trim().replace(/^(\d{4}-\d{2}-\d{2})\s+/, '$1T');
+  const ms = Date.parse(norm);
   return Number.isFinite(ms) ? ms : null;
 }
 
@@ -486,13 +487,16 @@ const EMPTY_TOKEN_SPEED = Object.freeze({
 
 /**
  * 解析会话紧凑日志 `transcript.jsonl`，生成执行轮次、词元统计、生成速度、子代理与待完成动作。
+ * 同时结合宿主 SQLite 实时步数（`runtimeMeta.liveStepCount`）折叠历史回滚分支与尾部撤回步骤。
  */
-export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null) {
+export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null, runtimeMeta = null) {
   const empty = {
     stepCount: 0,
     stepsSinceCompact: 0,
     compactCount: 0,
     lastCompactAtMs: null,
+    rolledBackSteps: 0,
+    revertedTailSteps: 0,
     titleCandidate: '',
     turnStartedAtMs: null,
     lastStepAtMs: transcriptMtimeMs || null,
@@ -514,19 +518,63 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null) {
 
   const hookEvents = Array.isArray(hookState?.recentHookEvents) ? hookState.recentHookEvents : [];
   const hookStopAtMs = Number(hookState?.stop?.stoppedAt) || 0;
+  const rt = runtimeMeta && typeof runtimeMeta === 'object' ? runtimeMeta : null;
+  const liveStepCount = Number.isFinite(rt?.liveStepCount) && rt.liveStepCount >= 0
+    ? rt.liveStepCount
+    : null;
 
-  const steps = [];
+  const rawSteps = [];
   for (const rawLine of text.split('\n')) {
     const trimmed = rawLine.trim();
     if (!trimmed) continue;
     try {
       const obj = JSON.parse(trimmed);
-      if (obj && typeof obj === 'object') steps.push(obj);
+      if (obj && typeof obj === 'object') rawSteps.push(obj);
     } catch {
       // 末尾行正在写入时安全跳过，下一轮轮询完整读取
     }
   }
-  if (!steps.length) return empty;
+  if (!rawSteps.length) return empty;
+
+  // 1. 折叠历史撤回分支：`transcript.jsonl` 为只追加日志，用户撤回后重新发送消息时 `step_index` 会回退重排
+  let rolledBackSteps = 0;
+  const branchSteps = [];
+  for (const obj of rawSteps) {
+    if (Number.isFinite(obj.step_index)) {
+      while (
+        branchSteps.length > 0
+        && Number.isFinite(branchSteps[branchSteps.length - 1].step_index)
+        && branchSteps[branchSteps.length - 1].step_index >= obj.step_index
+      ) {
+        branchSteps.pop();
+        rolledBackSteps += 1;
+      }
+    }
+    branchSteps.push(obj);
+  }
+
+  // 2. 裁剪刚撤回但尚未发送新消息的尾部残留步骤：宿主 `conversations/<id>.db` 在点击撤回瞬间即删除 `idx >= liveStepCount`
+  let revertedTailSteps = 0;
+  let steps = branchSteps;
+  if (liveStepCount != null) {
+    steps = [];
+    for (const st of branchSteps) {
+      if (Number.isFinite(st.step_index) && st.step_index >= liveStepCount) {
+        revertedTailSteps += 1;
+        continue;
+      }
+      steps.push(st);
+    }
+  }
+
+  if (!steps.length) {
+    return {
+      ...empty,
+      rolledBackSteps,
+      revertedTailSteps,
+      lastStepAtMs: revertedTailSteps > 0 ? null : (transcriptMtimeMs || null),
+    };
+  }
 
   let stepCount = steps.length;
   const lastStepObj = steps[steps.length - 1];
@@ -646,11 +694,78 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null) {
     const toolEntries = describedCalls.map((dc, idx) => {
       const resStep = genericResults[idx];
       if (!resStep) {
+        if (batchAbortedByLaterStep) {
+          return {
+            ...dc,
+            status: 'INTERRUPTED',
+            durationMs: null,
+            error: '该步骤执行途中因流传输中断而未完成',
+          };
+        }
+        // 对齐宿主 `conversations/<id>.db` 的实时步骤状态（9=WAITING 待确认，2=RUNNING 已放行，6/5=CANCELED 已拒绝/取消）
+        const expectedToolIdx = Number.isFinite(st.step_index) ? st.step_index + 1 + idx : null;
+        const dbStep = expectedToolIdx != null ? rt?.stepStatusByIndex?.[expectedToolIdx] : null;
+        if (dbStep && dbStep.stepType !== 15) {
+          if (dbStep.status === 9) {
+            return {
+              ...dc,
+              status: 'WAITING',
+              waitingApproval: true,
+              confirmedRunning: false,
+              durationMs: null,
+              error: '',
+            };
+          }
+          if (dbStep.status === 5 || dbStep.status === 6) {
+            return {
+              ...dc,
+              status: 'CANCELED',
+              durationMs: null,
+              error: '该操作已被取消或拒绝执行',
+            };
+          }
+          if (dbStep.status === 12) {
+            return {
+              ...dc,
+              status: 'INTERRUPTED',
+              durationMs: null,
+              error: '该步骤执行被中断',
+            };
+          }
+          if (dbStep.status === 7) {
+            return {
+              ...dc,
+              status: 'ERROR',
+              durationMs: null,
+              error: '工具执行返回异常',
+            };
+          }
+          if (dbStep.status === 3) {
+            return {
+              ...dc,
+              status: 'DONE',
+              durationMs: null,
+              error: '',
+            };
+          }
+          if (dbStep.status === 2 || dbStep.status === 1 || dbStep.status === 11) {
+            return {
+              ...dc,
+              status: 'PENDING',
+              waitingApproval: false,
+              confirmedRunning: dbStep.status === 2,
+              durationMs: null,
+              error: '',
+            };
+          }
+        }
         return {
           ...dc,
-          status: batchAbortedByLaterStep ? 'INTERRUPTED' : 'PENDING',
+          status: 'PENDING',
+          waitingApproval: false,
+          confirmedRunning: false,
           durationMs: null,
-          error: batchAbortedByLaterStep ? '该步骤执行途中因流传输中断而未完成' : '',
+          error: '',
         };
       }
       const { startedAtMs, completedAtMs } = parseGenericTimestamps(resStep.content);
@@ -730,9 +845,10 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null) {
           }
         }
         if (genMs == null && i === steps.length - 1) {
+          const safeMtimeMs = revertedTailSteps > 0 ? 0 : transcriptMtimeMs;
           const endCandidate = (hookStopAtMs && hookStopAtMs >= plannerCreatedMs)
             ? hookStopAtMs
-            : ((transcriptMtimeMs && transcriptMtimeMs >= plannerCreatedMs) ? transcriptMtimeMs : 0);
+            : ((safeMtimeMs && safeMtimeMs >= plannerCreatedMs) ? safeMtimeMs : 0);
           if (endCandidate > 0 && endCandidate - plannerCreatedMs <= 600_000) {
             genMs = Math.max(800, endCandidate - plannerCreatedMs);
           }
@@ -793,12 +909,14 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null) {
 
   const lastPlannerRound = [...rounds].reverse().find((r) => r.kind === 'planner') || null;
   const pendingTools = lastPlannerRound
-    ? lastPlannerRound.tools.filter((t) => t.status === 'PENDING')
+    ? lastPlannerRound.tools.filter((t) => t.status === 'PENDING' || t.status === 'WAITING')
     : [];
 
   let pendingStartedAtMs = null;
   if (pendingTools.length && lastPlannerRound) {
-    const completedInBatch = lastPlannerRound.tools.filter((t) => t.status !== 'PENDING' && t.endedAtMs);
+    const completedInBatch = lastPlannerRound.tools.filter(
+      (t) => t.status !== 'PENDING' && t.status !== 'WAITING' && t.endedAtMs,
+    );
     pendingStartedAtMs = completedInBatch.length
       ? completedInBatch[completedInBatch.length - 1].endedAtMs
       : (transcriptMtimeMs || lastPlannerRound.startedAtMs);
@@ -862,14 +980,20 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null) {
     ? Math.max(0, steps.length - 1 - lastCompactIdx)
     : stepCount;
 
+  const effectiveLastStepAtMs = revertedTailSteps > 0
+    ? (prevTimestampMs || null)
+    : (Math.max(prevTimestampMs || 0, transcriptMtimeMs || 0) || null);
+
   return {
     stepCount,
     stepsSinceCompact,
     compactCount,
     lastCompactAtMs,
+    rolledBackSteps,
+    revertedTailSteps,
     titleCandidate,
     turnStartedAtMs,
-    lastStepAtMs: Math.max(prevTimestampMs || 0, transcriptMtimeMs || 0) || null,
+    lastStepAtMs: effectiveLastStepAtMs,
     tokens: {
       input: totalInput,
       cache: totalCache,
@@ -895,7 +1019,7 @@ const STALE_UNHOOKED_MS = 20 * 60 * 1000;
 const STALE_FEEDBACK_MS = 30 * 60 * 1000;
 
 /**
- * 综合钩子快照、对话日志、子代理状态与系统子进程占用率，输出 6 态健康诊断结果。
+ * 综合钩子快照、对话日志、宿主 SQLite 实时状态、子代理与系统子进程占用率，输出健康诊断结果。
  */
 export function evaluateConversationHealth({
   now = Date.now(),
@@ -903,14 +1027,48 @@ export function evaluateConversationHealth({
   transcript = null,
   subagents = [],
   proc = null,
+  runtimeMeta = null,
   settings: rawSettings = DEFAULT_SETTINGS,
 } = {}) {
   const settings = normalizeSettings(rawSettings);
   const tr = transcript || parseTranscript('');
   const hook = hookState && typeof hookState === 'object' ? hookState : null;
+  const rt = runtimeMeta && typeof runtimeMeta === 'object' ? runtimeMeta : null;
 
   const modelName = localizeModelName(hook?.modelName || '');
-  const invocationNum = hook?.invocationNum || tr.rounds.filter((r) => r.kind === 'planner' && r.inCurrentTurn).length || 0;
+  const survivingTurnRounds = tr.rounds.filter((r) => r.kind === 'planner' && r.inCurrentTurn).length;
+
+  // 0. 优先检测用户「撤回（Undo/Revert）」动作：
+  // 点击撤回时宿主不会触发 Stop 钩子，也不会截断只追加的 transcript.jsonl，但会立即从 SQLite 删除回退步骤
+  const liveStepCount = Number.isFinite(rt?.liveStepCount) && rt.liveStepCount >= 0 ? rt.liveStepCount : null;
+  const hookWatermarkSteps = Math.max(
+    Number.isFinite(hook?.initialNumSteps) ? hook.initialNumSteps : 0,
+    Number.isFinite(hook?.lastTool?.stepIdx) ? hook.lastTool.stepIdx + 1 : 0,
+  );
+  const revertedByHookWatermark = liveStepCount != null
+    && hook?.phase !== 'stopped'
+    && hookWatermarkSteps > liveStepCount;
+  const isRevertedTail = (Number(tr.revertedTailSteps) || 0) > 0 || revertedByHookWatermark;
+
+  if (isRevertedTail) {
+    return {
+      state: 'IDLE',
+      badge: '已撤回',
+      severity: 'idle',
+      headline: '已撤回上一轮指令，等待重新输入',
+      detail: tr.stepCount > 0 ? `会话已回退至第 ${tr.stepCount} 步` : '',
+      elapsedSec: 0,
+      startedAtMs: rt?.lastModifiedMs || tr.lastStepAtMs || now,
+      turnStartedAtMs: tr.turnStartedAtMs || null,
+      turnDurationSec: 0,
+      modelName,
+      invocationNum: survivingTurnRounds,
+      process: null,
+      alertKey: null,
+    };
+  }
+
+  const invocationNum = hook?.invocationNum || survivingTurnRounds || 0;
   const turnStart = hook?.turnStartedAt || tr.turnStartedAtMs || null;
   const latestActivityMs = Math.max(hook?.updatedAt || 0, tr.lastStepAtMs || 0);
 
@@ -924,6 +1082,7 @@ export function evaluateConversationHealth({
       elapsedSec: 0,
       startedAtMs: latestActivityMs,
       turnStartedAtMs: turnStart,
+      turnDurationSec: 0,
       modelName,
       invocationNum,
       process: null,
@@ -940,6 +1099,69 @@ export function evaluateConversationHealth({
 
   const hookStopped = hook?.phase === 'stopped' && hook?.stop?.stoppedAt
     && (!tr.turnStartedAtMs || hook.stop.stoppedAt >= tr.turnStartedAtMs - 1000);
+
+  // 宿主级空闲/取消兜底：当用户在权限弹窗点击拒绝/停止而未触发 Stop 钩子时，SQLite 状态已转为 IDLE 且无活跃步骤
+  const latestTurnStartMs = Math.max(
+    hook?.invocationStartedAt || 0,
+    hook?.turnStartedAt || 0,
+    tr.turnStartedAtMs || 0,
+  );
+  const runtimeStoppedAfterTurnStart = Boolean(
+    !hookStopped
+    && rt
+    && rt.cascadeStatus === 'CASCADE_RUN_STATUS_IDLE'
+    && !rt.notFullyIdle
+    && !rt.hasRunningStep
+    && !rt.hasWaitingStep
+    && (
+      rt.hasCanceledTailStep
+      || (rt.lastModifiedMs && latestTurnStartMs > 0 && rt.lastModifiedMs >= latestTurnStartMs + 150)
+    ),
+  );
+
+  if (runtimeStoppedAfterTurnStart && activeSubagents.length === 0 && runningBgTasks.length === 0) {
+    const stopTs = rt.lastModifiedMs || now;
+    const totalTurnSec = turnStart && stopTs >= turnStart
+      ? Math.max(0, Math.round((stopTs - turnStart) / 1000))
+      : 0;
+    if (tr.turnIdleByTranscript && !rt.hasCanceledTailStep) {
+      const lastToolRoundInTurn = [...tr.rounds]
+        .reverse()
+        .find((r) => r.kind === 'planner' && r.inCurrentTurn && r.tools?.length > 0);
+      return {
+        state: 'COMPLETED',
+        badge: '已完成',
+        severity: 'idle',
+        headline: lastToolRoundInTurn?.tools?.[0]?.label
+          ? `最近操作：${lastToolRoundInTurn.tools[0].label}`
+          : '本轮执行已正常结束，等待新指令',
+        detail: '',
+        elapsedSec: 0,
+        startedAtMs: stopTs,
+        turnStartedAtMs: turnStart,
+        turnDurationSec: totalTurnSec,
+        modelName,
+        invocationNum,
+        process: null,
+        alertKey: null,
+      };
+    }
+    return {
+      state: 'IDLE',
+      badge: '已手动停止',
+      severity: 'idle',
+      headline: '任务已手动取消',
+      detail: '',
+      elapsedSec: 0,
+      startedAtMs: stopTs,
+      turnStartedAtMs: turnStart,
+      turnDurationSec: totalTurnSec,
+      modelName,
+      invocationNum,
+      process: null,
+      alertKey: null,
+    };
+  }
 
   // 1. 检查当前轮次尚未返回的工具调用
   if (!hookStopped && tr.pendingTools.length > 0) {
@@ -964,6 +1186,25 @@ export function evaluateConversationHealth({
       };
     }
 
+    // 宿主 SQLite 明确标记步骤处于 CORTEX_STEP_STATUS_WAITING (9)：零延迟精准提示权限确认
+    if (primaryTool.waitingApproval) {
+      const isCmd = primaryTool.name === 'run_command';
+      return {
+        state: 'WAITING_USER',
+        badge: '等待权限确认',
+        severity: 'action_required',
+        headline: `${isCmd ? '待确认命令' : '待确认操作'}：${primaryTool.label}`,
+        detail: '左侧对话窗正在等待你确认允许或拒绝该操作',
+        elapsedSec,
+        startedAtMs: startedAt,
+        turnStartedAtMs: turnStart,
+        modelName,
+        invocationNum,
+        process: null,
+        alertKey: `waiting-approval-${tr.stepCount}`,
+      };
+    }
+
     if (primaryTool.name === 'run_command') {
       if (proc && proc.cpu > 0.5) {
         return {
@@ -982,7 +1223,7 @@ export function evaluateConversationHealth({
         };
       }
 
-      if (!proc && elapsedSec >= settings.approvalHintSec) {
+      if (!proc && !primaryTool.confirmedRunning && elapsedSec >= settings.approvalHintSec) {
         return {
           state: 'WAITING_USER',
           badge: '等待权限确认',

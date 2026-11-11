@@ -137,7 +137,10 @@ try {
       next.sessionStartedAt = prev.sessionStartedAt || now;
     } else if (eventName === 'PreInvocation') {
       const invNum = Number.isFinite(payload.invocationNum) ? payload.invocationNum : ((prev.invocationNum || 0) + 1);
-      if (!next.turnStartedAt || prev.phase === 'stopped' || invNum <= 1) {
+      const stepRewound = Number.isFinite(payload.initialNumSteps)
+        && Number.isFinite(prev.initialNumSteps)
+        && payload.initialNumSteps < prev.initialNumSteps;
+      if (!next.turnStartedAt || prev.phase === 'stopped' || invNum === 0 || stepRewound) {
         next.turnStartedAt = now;
       }
       next.phase = 'thinking';

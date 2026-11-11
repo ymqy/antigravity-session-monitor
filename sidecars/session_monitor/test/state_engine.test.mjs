@@ -411,3 +411,228 @@ test('parseTranscript drops currentContext after SYSTEM CHECKPOINT so compact hi
   );
 });
 
+test('parseTranscript & evaluateConversationHealth detect user message Revert (撤回) immediately without Stop hook', () => {
+  const tPrevDone = Date.parse('2026-11-11T14:14:26Z');
+  const tRevertTurn = Date.parse('2026-11-11T14:16:34Z');
+  const tPlanner = Date.parse('2026-11-11T14:17:03Z');
+  const tRevertedAt = Date.parse('2026-11-11T14:17:20Z');
+
+  // Append-only transcript.jsonl retains reverted steps 952..958 even after user clicks 撤回
+  const lines = [
+    JSON.stringify({
+      step_index: 950,
+      type: 'USER_INPUT',
+      created_at: '2026-11-11T14:13:00Z',
+      content: '<USER_REQUEST>仓库里没啥代码啊</USER_REQUEST>',
+    }),
+    JSON.stringify({
+      step_index: 951,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-11T14:14:26Z',
+      input_tokens: 21000,
+      cache_read_tokens: 11000,
+      output_tokens: 450,
+      content: '代码都在 sidecars/session_monitor 目录下。',
+      tool_calls: [],
+    }),
+    JSON.stringify({
+      step_index: 952,
+      type: 'USER_INPUT',
+      created_at: '2026-11-11T14:16:34Z',
+      content: '<USER_REQUEST>跟本地对比怎么少了那么多文件夹啊</USER_REQUEST>',
+    }),
+    JSON.stringify({
+      step_index: 958,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-11T14:17:03Z',
+      input_tokens: 24000,
+      cache_read_tokens: 12000,
+      output_tokens: 300,
+      tool_calls: [
+        {
+          name: 'run_command',
+          args: { CommandLine: '"ls -la /Users/anon/dev/demo/agy-plugin/antigravity-session-monitor"' },
+        },
+      ],
+    }),
+  ].join('\n');
+
+  // Stale hookState: PreInvocation fired at step 958, and Antigravity never fires Stop on Revert
+  const staleHook = {
+    phase: 'thinking',
+    turnStartedAt: tRevertTurn,
+    invocationStartedAt: tPlanner,
+    invocationNum: 2,
+    initialNumSteps: 957,
+    stop: null,
+  };
+
+  // Host SQLite immediately deletes rows idx >= 952 -> liveStepCount drops to 952
+  const runtimeMeta = {
+    liveStepCount: 952,
+    cascadeStatus: 'CASCADE_RUN_STATUS_IDLE',
+    notFullyIdle: false,
+    lastModifiedMs: tRevertedAt,
+  };
+
+  const tr = parseTranscript(lines, tPlanner, staleHook, runtimeMeta);
+  assert.equal(tr.revertedTailSteps, 2);
+  assert.equal(tr.pendingTools.length, 0);
+  assert.equal(tr.stepCount, 952);
+  assert.equal(tr.tokens.currentContext, 32000);
+  assert.equal(tr.lastStepAtMs, tPrevDone);
+
+  const health = evaluateConversationHealth({
+    now: tRevertedAt + 35_000,
+    hookState: staleHook,
+    transcript: tr,
+    runtimeMeta,
+  });
+  assert.equal(health.state, 'IDLE');
+  assert.equal(health.badge, '已撤回');
+  assert.equal(health.severity, 'idle');
+  assert.equal(health.turnDurationSec, 0);
+  assert.match(health.detail, /952 步/);
+
+  // Edge case: Reverting the very first prompt of a brand-new conversation (liveStepCount -> 0)
+  const trZero = parseTranscript(lines, tPlanner, staleHook, { ...runtimeMeta, liveStepCount: 0 });
+  assert.equal(trZero.stepCount, 0);
+  assert.equal(trZero.revertedTailSteps, 4);
+  const healthZero = evaluateConversationHealth({
+    now: tRevertedAt + 5_000,
+    hookState: staleHook,
+    transcript: trZero,
+    runtimeMeta: { ...runtimeMeta, liveStepCount: 0 },
+  });
+  assert.equal(healthZero.state, 'IDLE');
+  assert.equal(healthZero.badge, '已撤回');
+});
+
+test('parseTranscript folds historical step_index rollbacks when user reverts and sends a new message', () => {
+  const lines = [
+    JSON.stringify({
+      step_index: 0,
+      type: 'USER_INPUT',
+      created_at: '2026-11-11T14:00:00Z',
+      content: '<USER_REQUEST>初始化项目</USER_REQUEST>',
+    }),
+    JSON.stringify({
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-11T14:00:05Z',
+      input_tokens: 5000,
+      output_tokens: 200,
+      content: '已初始化',
+    }),
+    // Reverted branch (steps 2..3) left in append-only transcript.jsonl
+    JSON.stringify({
+      step_index: 2,
+      type: 'USER_INPUT',
+      created_at: '2026-11-11T14:01:00Z',
+      content: '<USER_REQUEST>错误的提问分支</USER_REQUEST>',
+    }),
+    JSON.stringify({
+      step_index: 3,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-11T14:01:10Z',
+      input_tokens: 99000,
+      output_tokens: 8000,
+      tool_calls: [{ name: 'run_command', args: { CommandLine: '"rm -rf tmp"' } }],
+    }),
+    // User reverted step 2 and sent a new prompt -> step_index rewinds back to 2!
+    JSON.stringify({
+      step_index: 2,
+      type: 'USER_INPUT',
+      created_at: '2026-11-11T14:02:00Z',
+      content: '<USER_REQUEST>正确的提问分支</USER_REQUEST>',
+    }),
+    JSON.stringify({
+      step_index: 3,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-11T14:02:08Z',
+      input_tokens: 8000,
+      output_tokens: 300,
+      content: '已完成正确分支处理',
+    }),
+  ].join('\n');
+
+  const tr = parseTranscript(lines, Date.parse('2026-11-11T14:02:08Z'), null, { liveStepCount: 4 });
+  assert.equal(tr.rolledBackSteps, 2);
+  assert.equal(tr.revertedTailSteps, 0);
+  assert.equal(tr.stepCount, 4);
+  assert.equal(tr.rounds.length, 2);
+  // Ghost tokens (99000 in / 8000 out) from reverted branch must NOT be counted
+  assert.equal(tr.tokens.input, 13000);
+  assert.equal(tr.tokens.output, 500);
+  assert.equal(tr.pendingTools.length, 0);
+});
+
+test('SQLite CORTEX_STEP_STATUS_WAITING (9), RUNNING (2), and CANCELED (6) drive exact zero-delay state transitions', () => {
+  const t0 = Date.parse('2026-11-11T15:00:00Z');
+  const lines = [
+    JSON.stringify({
+      step_index: 10,
+      type: 'USER_INPUT',
+      created_at: '2026-11-11T15:00:00Z',
+      content: '<USER_REQUEST>部署测试环境</USER_REQUEST>',
+    }),
+    JSON.stringify({
+      step_index: 11,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-11T15:00:03Z',
+      input_tokens: 10000,
+      output_tokens: 250,
+      tool_calls: [{ name: 'run_command', args: { CommandLine: '"./deploy.sh"' } }],
+    }),
+  ].join('\n');
+
+  const hook = {
+    phase: 'thinking',
+    turnStartedAt: t0,
+    invocationStartedAt: t0 + 3_000,
+    invocationNum: 1,
+    initialNumSteps: 11,
+  };
+
+  // 1) Status 9 (WAITING): surfaces 等待权限确认 immediately at 1s without waiting 15s!
+  const rtWaiting = {
+    liveStepCount: 13,
+    cascadeStatus: 'CASCADE_RUN_STATUS_RUNNING',
+    notFullyIdle: true,
+    hasWaitingStep: true,
+    stepStatusByIndex: { 12: { status: 9, stepType: 132 } },
+  };
+  const trWait = parseTranscript(lines, t0 + 3_000, hook, rtWaiting);
+  const hWait = evaluateConversationHealth({ now: t0 + 4_000, hookState: hook, transcript: trWait, runtimeMeta: rtWaiting });
+  assert.equal(hWait.state, 'WAITING_USER');
+  assert.equal(hWait.badge, '等待权限确认');
+
+  // 2) Status 2 (RUNNING): approved low-CPU command at 25s stays TOOL_ACTIVE (never false 等待权限确认!)
+  const rtRunning = {
+    liveStepCount: 13,
+    cascadeStatus: 'CASCADE_RUN_STATUS_RUNNING',
+    notFullyIdle: true,
+    hasRunningStep: true,
+    stepStatusByIndex: { 12: { status: 2, stepType: 132 } },
+  };
+  const trRun = parseTranscript(lines, t0 + 3_000, hook, rtRunning);
+  const hRun = evaluateConversationHealth({ now: t0 + 28_000, hookState: hook, transcript: trRun, proc: null, runtimeMeta: rtRunning });
+  assert.equal(hRun.state, 'TOOL_ACTIVE');
+  assert.equal(hRun.badge, '命令执行中');
+
+  // 3) Status 6 (CANCELED) + CASCADE_RUN_STATUS_IDLE without Stop hook: transitions immediately to IDLE ('已手动停止')
+  const rtCanceled = {
+    liveStepCount: 13,
+    cascadeStatus: 'CASCADE_RUN_STATUS_IDLE',
+    notFullyIdle: false,
+    hasCanceledTailStep: true,
+    lastModifiedMs: t0 + 8_000,
+    stepStatusByIndex: { 12: { status: 6, stepType: 132 } },
+  };
+  const trCancel = parseTranscript(lines, t0 + 3_000, hook, rtCanceled);
+  assert.equal(trCancel.pendingTools.length, 0);
+  const hCancel = evaluateConversationHealth({ now: t0 + 9_000, hookState: hook, transcript: trCancel, runtimeMeta: rtCanceled });
+  assert.equal(hCancel.state, 'IDLE');
+  assert.equal(hCancel.badge, '已手动停止');
+});
+

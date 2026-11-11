@@ -27,6 +27,7 @@ import {
   matchActiveProcess,
   normalizeSettings,
   oneLine,
+  parseIsoMs,
   parseMilestoneMarkdown,
   parsePsOutput,
   parseTranscript,
@@ -115,16 +116,189 @@ function readCached(filePath, maxBytes = 8 * 1024 * 1024) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Host SQLite Ground-Truth Readers (`conversation_summaries.db` & `conversations/<id>.db`)
+// Uses built-in `node:sqlite` (Node 22.5+/Electron 24) with stat-based caching and immediate close.
+// ---------------------------------------------------------------------------
+
+let DatabaseSync = null;
+try {
+  ({ DatabaseSync } = await import('node:sqlite'));
+} catch {
+  DatabaseSync = null;
+}
+
+function sqliteFileSig(dbPath) {
+  const dbSt = statOf(dbPath);
+  if (!dbSt.isFile || dbSt.size <= 0) return '';
+  const walSt = statOf(`${dbPath}-wal`);
+  return `${Math.round(dbSt.mtime)}:${dbSt.size}|${Math.round(walSt.mtime)}:${walSt.size}`;
+}
+
+const summaryDbCache = new Map(); // appData -> { sig, byId: Map }
+
+function getSummaryRow(appData, convId) {
+  if (!DatabaseSync || !appData || !convId) return null;
+  const dbPath = join(appData, 'conversation_summaries.db');
+  const sig = sqliteFileSig(dbPath);
+  if (!sig) return null;
+
+  const cached = summaryDbCache.get(appData);
+  if (cached && cached.sig === sig) {
+    return cached.byId.get(convId) || null;
+  }
+
+  let db = null;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true, timeout: 150 });
+    const rows = db.prepare(
+      `SELECT conversation_id, title, step_count, status, not_fully_idle, killed,
+              last_user_input_step_index, last_modified_time
+       FROM conversation_summaries
+       ORDER BY last_modified_time DESC
+       LIMIT 400`,
+    ).all();
+    const byId = new Map();
+    for (const r of rows) {
+      if (!r?.conversation_id) continue;
+      const rawTitle = typeof r.title === 'string' ? r.title.replace(/^\/[a-zA-Z0-9_-]+\s+/, '').trim() : '';
+      byId.set(r.conversation_id, {
+        title: rawTitle ? oneLine(rawTitle, 90) : '',
+        stepCount: Number.isFinite(r.step_count) ? Number(r.step_count) : null,
+        cascadeStatus: typeof r.status === 'string' ? r.status : '',
+        notFullyIdle: Boolean(r.not_fully_idle),
+        killed: Boolean(r.killed),
+        lastUserInputStepIndex: Number.isFinite(r.last_user_input_step_index) ? Number(r.last_user_input_step_index) : -1,
+        lastModifiedMs: parseIsoMs(typeof r.last_modified_time === 'string' ? r.last_modified_time : ''),
+      });
+    }
+    if (summaryDbCache.size > 8) summaryDbCache.clear();
+    summaryDbCache.set(appData, { sig, byId });
+    return byId.get(convId) || null;
+  } catch {
+    return cached?.byId?.get(convId) || null;
+  } finally {
+    try { db?.close(); } catch {}
+  }
+}
+
+const convDbCache = new Map(); // dbPath -> { sig, info }
+
+function readConvDbStepsInfo(appData, convId) {
+  if (!DatabaseSync || !appData || !convId) return null;
+  const dbPath = join(appData, 'conversations', `${convId}.db`);
+  const sig = sqliteFileSig(dbPath);
+  if (!sig) return null;
+
+  const cached = convDbCache.get(dbPath);
+  if (cached && cached.sig === sig) return cached.info;
+
+  let db = null;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true, timeout: 150 });
+    const tailRows = db.prepare(
+      'SELECT idx, step_type AS stepType, status FROM steps ORDER BY idx DESC LIMIT 12',
+    ).all();
+    const liveStepCount = tailRows.length > 0 && Number.isFinite(tailRows[0].idx)
+      ? Number(tailRows[0].idx) + 1
+      : 0;
+
+    const stepStatusByIndex = {};
+    const batchAfterPlanner = [];
+    let hitPlanner = false;
+    for (const r of tailRows) {
+      const idx = Number(r.idx);
+      const status = Number(r.status);
+      const stepType = Number(r.stepType);
+      if (Number.isFinite(idx)) {
+        stepStatusByIndex[idx] = { status, stepType };
+      }
+      if (!hitPlanner) {
+        if (stepType === 15) {
+          hitPlanner = true;
+        } else {
+          batchAfterPlanner.push({ idx, stepType, status });
+        }
+      }
+    }
+
+    // CortexStepStatus: 1=PENDING, 2=RUNNING, 3=DONE, 4=INVALID, 5=CLEARED,
+    // 6=CANCELED, 7=ERROR, 8=GENERATING, 9=WAITING, 11=QUEUED, 12=INTERRUPTED
+    const hasWaitingStep = batchAfterPlanner.some((s) => s.status === 9);
+    const hasRunningStep = tailRows[0]?.status === 8
+      || batchAfterPlanner.some((s) => s.status === 1 || s.status === 2 || s.status === 8 || s.status === 11);
+    const hasCanceledTailStep = batchAfterPlanner.length > 0
+      && batchAfterPlanner.every((s) => [3, 4, 5, 6, 7, 12].includes(s.status))
+      && batchAfterPlanner.some((s) => s.status === 5 || s.status === 6 || s.status === 12);
+
+    const info = {
+      sig,
+      liveStepCount,
+      tailStepIdx: tailRows.length > 0 ? Number(tailRows[0].idx) : -1,
+      tailStepStatus: tailRows.length > 0 ? Number(tailRows[0].status) : null,
+      hasWaitingStep,
+      hasRunningStep,
+      hasCanceledTailStep,
+      stepStatusByIndex,
+    };
+    if (convDbCache.size > 200) convDbCache.clear();
+    convDbCache.set(dbPath, { sig, info });
+    return info;
+  } catch {
+    return cached?.info || null;
+  } finally {
+    try { db?.close(); } catch {}
+  }
+}
+
+function readRuntimeMeta(appData, convId) {
+  const summary = getSummaryRow(appData, convId);
+  const convDb = readConvDbStepsInfo(appData, convId);
+  if (!summary && !convDb) return null;
+
+  const liveStepCount = convDb
+    ? convDb.liveStepCount
+    : (summary?.cascadeStatus === 'CASCADE_RUN_STATUS_IDLE' ? summary.stepCount : null);
+
+  const key = [
+    liveStepCount ?? '-',
+    convDb?.tailStepStatus ?? '-',
+    convDb?.hasWaitingStep ? 1 : 0,
+    convDb?.hasRunningStep ? 1 : 0,
+    convDb?.hasCanceledTailStep ? 1 : 0,
+    summary?.cascadeStatus || '-',
+    summary?.notFullyIdle ? 1 : 0,
+    summary?.lastModifiedMs || 0,
+  ].join(':');
+
+  return {
+    key,
+    title: summary?.title || '',
+    liveStepCount,
+    cascadeStatus: summary?.cascadeStatus || '',
+    notFullyIdle: Boolean(summary?.notFullyIdle),
+    killed: Boolean(summary?.killed),
+    lastModifiedMs: summary?.lastModifiedMs || null,
+    lastUserInputStepIndex: summary?.lastUserInputStepIndex ?? -1,
+    tailStepStatus: convDb?.tailStepStatus ?? null,
+    hasWaitingStep: Boolean(convDb?.hasWaitingStep),
+    hasRunningStep: Boolean(convDb?.hasRunningStep),
+    hasCanceledTailStep: Boolean(convDb?.hasCanceledTailStep),
+    stepStatusByIndex: convDb?.stepStatusByIndex || null,
+  };
+}
+
 const parsedTranscriptCache = new Map();
-function getParsedTranscript(appData, convId, hookData = null) {
+function getParsedTranscript(appData, convId, hookData = null, runtimeMeta = null) {
   const p = join(appData, 'brain', convId, '.system_generated', 'logs', 'transcript.jsonl');
   const f = readCached(p, 16 * 1024 * 1024);
-  if (f.text == null) return { key: '-', parsed: parseTranscript('', 0, hookData), mtime: 0 };
+  if (f.text == null) return { key: '-', parsed: parseTranscript('', 0, hookData, runtimeMeta), mtime: 0 };
   const hookSig = `${hookData?.stop?.stoppedAt || 0}:${hookData?.recentHookEvents?.length || 0}`;
-  const fullKey = `${f.key}|${hookSig}`;
+  const rtSig = runtimeMeta?.key || '-';
+  const fullKey = `${f.key}|${hookSig}|${rtSig}`;
   const hit = parsedTranscriptCache.get(p);
   if (hit && hit.key === fullKey) return hit;
-  const parsed = parseTranscript(f.text, f.mtime, hookData);
+  const parsed = parseTranscript(f.text, f.mtime, hookData, runtimeMeta);
   const entry = { key: fullKey, parsed, mtime: f.mtime };
   if (parsedTranscriptCache.size > 200) parsedTranscriptCache.clear();
   parsedTranscriptCache.set(p, entry);
@@ -338,7 +512,8 @@ function locateConversationAppData(convId) {
 function summarizeSubagent(appData, ref, psRows, now) {
   const subId = ref.conversationId;
   const hook = readHookSession(appData, subId);
-  const trEntry = getParsedTranscript(appData, subId, hook.data);
+  const runtimeMeta = readRuntimeMeta(appData, subId);
+  const trEntry = getParsedTranscript(appData, subId, hook.data, runtimeMeta);
   const tr = trEntry.parsed;
 
   let proc = null;
@@ -356,6 +531,7 @@ function summarizeSubagent(appData, ref, psRows, now) {
     transcript: tr,
     subagents: [],
     proc,
+    runtimeMeta,
     settings: userSettings,
   });
 
@@ -399,7 +575,8 @@ function buildConversationSnapshot(convId, psRows, now) {
 
   const appData = locateConversationAppData(convId);
   const hook = readHookSession(appData, convId);
-  const trEntry = getParsedTranscript(appData, convId, hook.data);
+  const runtimeMeta = readRuntimeMeta(appData, convId);
+  const trEntry = getParsedTranscript(appData, convId, hook.data, runtimeMeta);
   const tr = trEntry.parsed;
   const msEntry = readConversationMilestones(appData, convId);
 
@@ -432,12 +609,13 @@ function buildConversationSnapshot(convId, psRows, now) {
     transcript: tr,
     subagents,
     proc,
+    runtimeMeta,
     settings: userSettings,
   });
 
-  const rawFallbackTitle = tr.titleCandidate || hook.data?.firstUserInput || hook.data?.lastUserInput || '';
+  const rawFallbackTitle = runtimeMeta?.title || tr.titleCandidate || hook.data?.firstUserInput || hook.data?.lastUserInput || '';
   const fallbackTitle = String(rawFallbackTitle).replace(/^\/[a-zA-Z0-9_-]+\s+/, '');
-  const title = resolveConversationTitle(convId, fallbackTitle);
+  const title = runtimeMeta?.title || resolveConversationTitle(convId, fallbackTitle);
   const workspaceName = Array.isArray(hook.data?.workspacePaths) && hook.data.workspacePaths[0]
     ? basename(hook.data.workspacePaths[0])
     : '';
@@ -452,9 +630,10 @@ function buildConversationSnapshot(convId, psRows, now) {
     { input: 0, cache: 0, output: 0 },
   );
 
-  const totalTurnSec = health.turnStartedAtMs
-    ? (health.turnDurationSec ?? Math.max(0, Math.round((now - health.turnStartedAtMs) / 1000)))
-    : 0;
+  const isEndedState = ['IDLE', 'COMPLETED', 'ERROR_STOPPED'].includes(health.state);
+  const totalTurnSec = health.turnDurationSec != null
+    ? health.turnDurationSec
+    : (!isEndedState && health.turnStartedAtMs ? Math.max(0, Math.round((now - health.turnStartedAtMs) / 1000)) : 0);
 
   const activeSubagentTpsSum = Math.round(
     subagents
@@ -493,7 +672,7 @@ function buildConversationSnapshot(convId, psRows, now) {
 
   return {
     conversationId: convId,
-    found: Boolean(hook.data || tr.stepCount > 0 || msEntry.milestones),
+    found: Boolean(hook.data || tr.stepCount > 0 || runtimeMeta || msEntry.milestones),
     title: title || '当前会话',
     workspaceName,
     etagPart,
@@ -569,18 +748,19 @@ function getGlobalSessions(psRows, now) {
 
   for (const [id, { appData, mtime }] of sorted) {
     const hook = readHookSession(appData, id);
-    const trEntry = getParsedTranscript(appData, id, hook.data);
+    const runtimeMeta = readRuntimeMeta(appData, id);
+    const trEntry = getParsedTranscript(appData, id, hook.data, runtimeMeta);
     for (const sr of trEntry.parsed.subagentRefs) {
       childSubagentIds.add(sr.conversationId);
     }
     for (const sr of readSwarmSubagentRefs(appData, id)) {
       childSubagentIds.add(sr.conversationId);
     }
-    rawSummaries.push({ id, appData, mtime, hook, tr: trEntry.parsed });
+    rawSummaries.push({ id, appData, mtime, hook, runtimeMeta, tr: trEntry.parsed });
   }
 
   const items = [];
-  for (const { id, appData, mtime, hook, tr } of rawSummaries) {
+  for (const { id, appData, mtime, hook, runtimeMeta, tr } of rawSummaries) {
     if (childSubagentIds.has(id)) continue;
     let proc = null;
     if (tr.pendingTools[0]?.name === 'run_command') {
@@ -596,12 +776,13 @@ function getGlobalSessions(psRows, now) {
       transcript: tr,
       subagents: [],
       proc,
+      runtimeMeta,
       settings: userSettings,
     });
     const msEntry = readConversationMilestones(appData, id);
-    const rawFallbackTitle = tr.titleCandidate || hook.data?.firstUserInput || hook.data?.lastUserInput || id.slice(0, 8);
+    const rawFallbackTitle = runtimeMeta?.title || tr.titleCandidate || hook.data?.firstUserInput || hook.data?.lastUserInput || id.slice(0, 8);
     const fallbackTitle = String(rawFallbackTitle).replace(/^\/[a-zA-Z0-9_-]+\s+/, '');
-    const title = resolveConversationTitle(id, fallbackTitle);
+    const title = runtimeMeta?.title || resolveConversationTitle(id, fallbackTitle);
     const workspaceName = Array.isArray(hook.data?.workspacePaths) && hook.data.workspacePaths[0]
       ? basename(hook.data.workspacePaths[0])
       : '';
@@ -634,7 +815,7 @@ function getGlobalSessions(psRows, now) {
       ),
       tokenSpeed: tr.tokenSpeed,
       outTokens: tr.tokens.output,
-      updatedAtMs: Math.max(mtime, hook.data?.updatedAt || 0),
+      updatedAtMs: Math.max(mtime, hook.data?.updatedAt || 0, runtimeMeta?.lastModifiedMs || 0),
     });
   }
 

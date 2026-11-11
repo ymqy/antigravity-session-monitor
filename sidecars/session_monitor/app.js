@@ -25,6 +25,7 @@
     tlFilter: 'all',
     drawerSettingsOpen: false,
     nudgeOpen: false,
+    prevHealthState: '',
     autoExpandedAlertKey: '',
     msExpandedOverride: null, // null = 自动（<100% 展开，100% 收起），boolean = 用户手动切换
     lastMsConvKey: '',
@@ -298,7 +299,11 @@
       compactBadge.classList.add('hidden');
     }
 
-    // 异常干预栏（仅在阻塞/断流/待确认时浮现）
+    // 异常干预栏（仅在阻塞/断流/待确认时浮现；撤回、停止或恢复正常后自动收起）
+    if (!INTERVENE_STATES.has(h.state) && state.prevHealthState && INTERVENE_STATES.has(state.prevHealthState)) {
+      state.nudgeOpen = false;
+    }
+    state.prevHealthState = h.state || '';
     if ((h.state === 'STUCK_SUSPECTED' || h.state === 'ERROR_STOPPED') && h.alertKey && state.autoExpandedAlertKey !== h.alertKey) {
       state.autoExpandedAlertKey = h.alertKey;
       state.nudgeOpen = true;
@@ -527,12 +532,18 @@
       const toolsHtml = (r.tools || []).map((t) => {
         const icon = t.status === 'ERROR'
           ? '✗'
-          : (t.status === 'INTERRUPTED' ? '⊘' : (t.status === 'PENDING' || t.status === 'RUNNING' ? '⟳' : '✓'));
+          : ((t.status === 'INTERRUPTED' || t.status === 'CANCELED')
+            ? '⊘'
+            : (t.status === 'PENDING' || t.status === 'RUNNING' || t.status === 'WAITING' ? '⟳' : '✓'));
         const durSec = t.durationMs != null ? t.durationMs / 1000 : null;
         const isSlow = durSec != null && durSec >= 15;
         const durLabel = durSec != null
           ? fmtShortDur(durSec)
-          : (t.status === 'INTERRUPTED' ? '已中断' : (t.status === 'PENDING' ? '进行中…' : ''));
+          : (t.status === 'CANCELED'
+            ? '已取消'
+            : (t.status === 'INTERRUPTED'
+              ? '已中断'
+              : (t.status === 'WAITING' ? '待确认…' : (t.status === 'PENDING' ? '进行中…' : ''))));
         return `
           <div class="tl-tool ${isSlow ? 'slow' : ''}">
             <span class="tl-tool-label" title="${esc(t.detail || t.label)}">${icon} ${esc(t.label)}</span>
