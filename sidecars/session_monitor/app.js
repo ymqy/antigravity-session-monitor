@@ -820,11 +820,10 @@
     renderAll();
 
     try {
-      // 仅当用户在面板中手动切到了另一个会话时，才通知宿主切到目标会话；已在当前会话时绝不重复调用 toggleConversation
-      const hostConvId = state.snap?.conversationId || window.sidecar?.conversationId || '';
-      if (state.overrideConvId && cid && cid !== hostConvId && window.sidecar?.ui?.toggleConversation) {
+      // 必须调用 toggleConversation(cid)，通知宿主把键盘焦点从右侧 Sidecar WebView 切回左侧对话窗输入框
+      if (cid && window.sidecar?.ui?.toggleConversation) {
         window.sidecar.ui.toggleConversation(cid);
-        await new Promise((r) => setTimeout(r, 300));
+        await new Promise((r) => setTimeout(r, 260));
       }
       const res = await apiPost('/api/compact', {
         conversationId: cid,

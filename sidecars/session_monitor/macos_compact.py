@@ -19,12 +19,28 @@ COMPACT_DRAFTS = {"/compact", "compact"}
 SEND_BUTTON_LABELS = {"send message", "send", "submit", "发送", "发送消息"}
 
 K_CF_STRING_ENCODING_UTF8 = 0x08000100
+K_AX_VALUE_CGPOINT_TYPE = 1
+K_AX_VALUE_CGSIZE_TYPE = 2
 K_CG_EVENT_SOURCE_STATE_PRIVATE = -1
 K_CG_EVENT_FLAG_MASK_COMMAND = 0x100000
+K_CG_EVENT_LEFT_MOUSE_DOWN = 1
+K_CG_EVENT_LEFT_MOUSE_UP = 2
+K_CG_EVENT_MOUSE_MOVED = 5
+K_CG_MOUSE_BUTTON_LEFT = 0
+K_CG_HID_EVENT_TAP = 0
 
 KEYCODE_A = 0
 KEYCODE_RETURN = 36
 KEYCODE_DELETE = 51
+
+
+class CGPoint(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+
+class CGSize(ctypes.Structure):
+    _fields_ = [("width", ctypes.c_double), ("height", ctypes.c_double)]
+
 
 cf = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
 ax = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
@@ -59,14 +75,27 @@ ax.AXUIElementSetAttributeValue.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ct
 ax.AXUIElementSetAttributeValue.restype = ctypes.c_int32
 ax.AXUIElementPerformAction.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 ax.AXUIElementPerformAction.restype = ctypes.c_int32
+ax.AXValueGetValue.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_void_p]
+ax.AXValueGetValue.restype = ctypes.c_bool
 
 cg.CGEventSourceCreate.argtypes = [ctypes.c_int32]
 cg.CGEventSourceCreate.restype = ctypes.c_void_p
+cg.CGEventCreate.argtypes = [ctypes.c_void_p]
+cg.CGEventCreate.restype = ctypes.c_void_p
+cg.CGEventGetLocation.argtypes = [ctypes.c_void_p]
+cg.CGEventGetLocation.restype = CGPoint
 cg.CGEventCreateKeyboardEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint16, ctypes.c_bool]
 cg.CGEventCreateKeyboardEvent.restype = ctypes.c_void_p
+cg.CGEventCreateMouseEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint32, CGPoint, ctypes.c_uint32]
+cg.CGEventCreateMouseEvent.restype = ctypes.c_void_p
 cg.CGEventSetFlags.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
 cg.CGEventKeyboardSetUnicodeString.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_uint16)]
 cg.CGEventPostToPid.argtypes = [ctypes.c_int, ctypes.c_void_p]
+cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+cg.CGWarpMouseCursorPosition.argtypes = [CGPoint]
+cg.CGWarpMouseCursorPosition.restype = ctypes.c_int32
+cg.CGAssociateMouseAndMouseCursorPosition.argtypes = [ctypes.c_bool]
+cg.CGAssociateMouseAndMouseCursorPosition.restype = ctypes.c_int32
 
 STR_ID = cf.CFStringGetTypeID()
 ARR_ID = cf.CFArrayGetTypeID()
@@ -102,6 +131,38 @@ def read_str_attr(el: int, name: str) -> str:
         return py_str(ref)
     finally:
         cf.CFRelease(ref)
+
+
+def read_bool_attr(el: int, name: str) -> bool:
+    ref = copy_attr(el, name)
+    if not ref:
+        return False
+    try:
+        return bool(ref == K_CF_BOOLEAN_TRUE.value)
+    finally:
+        cf.CFRelease(ref)
+
+
+def get_element_rect(el: int) -> tuple[float, float, float, float] | None:
+    pos_ref = copy_attr(el, "AXPosition")
+    size_ref = copy_attr(el, "AXSize")
+    if not pos_ref or not size_ref:
+        if pos_ref:
+            cf.CFRelease(pos_ref)
+        if size_ref:
+            cf.CFRelease(size_ref)
+        return None
+    try:
+        pt = CGPoint()
+        sz = CGSize()
+        ok1 = ax.AXValueGetValue(pos_ref, K_AX_VALUE_CGPOINT_TYPE, ctypes.byref(pt))
+        ok2 = ax.AXValueGetValue(size_ref, K_AX_VALUE_CGSIZE_TYPE, ctypes.byref(sz))
+        if not (ok1 and ok2):
+            return None
+        return (float(pt.x), float(pt.y), float(sz.width), float(sz.height))
+    finally:
+        cf.CFRelease(pos_ref)
+        cf.CFRelease(size_ref)
 
 
 def set_attr(el: int, name: str, val_ref: int | ctypes.c_void_p) -> int:
@@ -181,11 +242,12 @@ def ordered_windows(app_ref: int, title_hint: str, ws_hint: str) -> list[int]:
 
 def scan_window(win_ref: int) -> tuple[int | None, bool]:
     msg_el: int | None = None
+    fallback_msg_el: int | None = None
     compacting = False
 
     def walk(el: int, depth: int = 0) -> None:
-        nonlocal msg_el, compacting
-        if not el or depth > 36 or (msg_el is not None and compacting):
+        nonlocal msg_el, fallback_msg_el, compacting
+        if not el or depth > 42 or (msg_el is not None and compacting):
             return
         role = read_str_attr(el, "AXRole")
         if role in ("AXStaticText", "AXButton", "AXGroup"):
@@ -196,13 +258,17 @@ def scan_window(win_ref: int) -> tuple[int | None, bool]:
             desc = read_str_attr(el, "AXDescription")
             title = read_str_attr(el, "AXTitle")
             if desc == "Message input" or title == "Message input":
-                msg_el = int(cf.CFRetain(el))
+                rect = get_element_rect(el)
+                if rect and rect[2] > 40 and rect[3] > 8:
+                    msg_el = int(cf.CFRetain(el))
+                elif fallback_msg_el is None:
+                    fallback_msg_el = int(cf.CFRetain(el))
 
         children_ref = copy_attr(el, "AXChildren")
         if children_ref:
             try:
                 if cf.CFGetTypeID(children_ref) == ARR_ID:
-                    cnt = min(cf.CFArrayGetCount(children_ref), 250)
+                    cnt = min(cf.CFArrayGetCount(children_ref), 300)
                     for i in range(cnt):
                         child = cf.CFArrayGetValueAtIndex(children_ref, i)
                         walk(child, depth + 1)
@@ -212,14 +278,17 @@ def scan_window(win_ref: int) -> tuple[int | None, bool]:
                 cf.CFRelease(children_ref)
 
     walk(win_ref, 0)
-    return msg_el, compacting
+    if msg_el is not None:
+        if fallback_msg_el is not None:
+            cf.CFRelease(fallback_msg_el)
+        return msg_el, compacting
+    return fallback_msg_el, compacting
 
 
 def locate_composer(app_ref: int, title_hint: str, ws_hint: str) -> tuple[int | None, str, int | None, bool]:
     """Locate window and Message input across windows, retrying briefly if Electron AX tree is waking up."""
     for attempt in range(4):
         wins = ordered_windows(app_ref, title_hint, ws_hint)
-        chosen_win: int | None = None
         try:
             for w in wins:
                 win_title = read_str_attr(w, "AXTitle")
@@ -276,10 +345,48 @@ def find_send_button(msg_el: int) -> int | None:
     return found
 
 
-def focus_composer(msg_el: int) -> None:
+def focus_composer(app_ref: int, win_ref: int, msg_el: int) -> None:
+    set_attr(win_ref, "AXMain", K_CF_BOOLEAN_TRUE)
     perform_action(msg_el, "AXPress")
     set_attr(msg_el, "AXFocused", K_CF_BOOLEAN_TRUE)
+    set_attr(app_ref, "AXFocusedUIElement", msg_el)
     time.sleep(0.04)
+
+
+def click_element_restore_cursor(el: int, x_ratio: float = 0.35) -> bool:
+    """Click `el`'s screen rect to transfer `NSWindow.firstResponder` out of Sidecar WebView, then restore cursor."""
+    rect = get_element_rect(el)
+    if not rect or rect[2] < 6 or rect[3] < 6:
+        return False
+
+    cur_ev = cg.CGEventCreate(None)
+    saved_pt = cg.CGEventGetLocation(cur_ev) if cur_ev else None
+    if cur_ev:
+        cf.CFRelease(cur_ev)
+
+    target_pt = CGPoint(rect[0] + rect[2] * x_ratio, rect[1] + rect[3] * 0.5)
+    src = cg.CGEventSourceCreate(K_CG_EVENT_SOURCE_STATE_PRIVATE)
+    try:
+        down = cg.CGEventCreateMouseEvent(src, K_CG_EVENT_LEFT_MOUSE_DOWN, target_pt, K_CG_MOUSE_BUTTON_LEFT)
+        up = cg.CGEventCreateMouseEvent(src, K_CG_EVENT_LEFT_MOUSE_UP, target_pt, K_CG_MOUSE_BUTTON_LEFT)
+        cg.CGEventSetFlags(down, 0)
+        cg.CGEventSetFlags(up, 0)
+        cg.CGEventPost(K_CG_HID_EVENT_TAP, down)
+        time.sleep(0.012)
+        cg.CGEventPost(K_CG_HID_EVENT_TAP, up)
+        cf.CFRelease(down)
+        cf.CFRelease(up)
+        if saved_pt is not None:
+            move_back = cg.CGEventCreateMouseEvent(src, K_CG_EVENT_MOUSE_MOVED, saved_pt, K_CG_MOUSE_BUTTON_LEFT)
+            cg.CGEventPost(K_CG_HID_EVENT_TAP, move_back)
+            cf.CFRelease(move_back)
+            cg.CGWarpMouseCursorPosition(saved_pt)
+            cg.CGAssociateMouseAndMouseCursorPosition(True)
+    finally:
+        if src:
+            cf.CFRelease(src)
+    time.sleep(0.05)
+    return True
 
 
 def post_unicode_text(pid: int, text: str) -> None:
@@ -324,9 +431,9 @@ def post_return(pid: int) -> None:
     post_key(pid, KEYCODE_RETURN, 0)
 
 
-def clear_composer_input(pid: int, msg_el: int) -> None:
+def clear_composer_input(pid: int, app_ref: int, win_ref: int, msg_el: int) -> None:
     """Roll back any unsubmitted `/compact` text/chip so the user's input box stays clean."""
-    focus_composer(msg_el)
+    focus_composer(app_ref, win_ref, msg_el)
     post_key(pid, KEYCODE_A, K_CG_EVENT_FLAG_MASK_COMMAND)
     time.sleep(0.03)
     post_key(pid, KEYCODE_DELETE, 0)
@@ -402,30 +509,54 @@ def main() -> int:
                     "readyToCompact": True,
                 })
 
-            # Step 1: Focus composer and enter `/compact` if not already staged as `/compact` or `compact` chip
-            focus_composer(msg_el)
-            if draft not in COMPACT_DRAFTS:
+            frontmost = read_bool_attr(app_ref, "AXFrontmost")
+
+            # Step 1: Focus composer and stage `/compact`. Verify that `/compact` ACTUALLY entered `msg_el`!
+            staged = draft
+            focus_composer(app_ref, win_ref, msg_el)
+            if staged not in COMPACT_DRAFTS:
+                set_str_attr(msg_el, "AXSelectedText", "/compact")
+                time.sleep(0.05)
+                staged = clean_draft(read_str_attr(msg_el, "AXValue"))
+
+            if staged not in COMPACT_DRAFTS:
                 post_unicode_text(pid, "/compact")
                 time.sleep(0.18)
+                staged = clean_draft(read_str_attr(msg_el, "AXValue"))
+
+            # Fallback when clicking inside the Sidecar WebView kept `NSWindow.firstResponder` on the Sidecar:
+            # click `Message input` directly (restoring mouse cursor immediately) to force Cocoa responder switch.
+            if staged not in COMPACT_DRAFTS and frontmost:
+                if click_element_restore_cursor(msg_el, 0.35):
+                    post_unicode_text(pid, "/compact")
+                    time.sleep(0.18)
+                    _, staged, cur_msg = check_composer_state(win_ref, msg_el)
+                    cf.CFRelease(cur_msg)
+
+            if staged not in COMPACT_DRAFTS:
+                return emit({
+                    "ok": False,
+                    "reason": "焦点仍停留在右侧面板，未能写入对话输入框，请先点一下左侧对话区再试",
+                })
 
             # Step 2: First Return (accepts `/compact` chip from `/` autocomplete menu -> AXValue becomes `'compact '`,
             # or submits immediately if already a chip / no popup)
-            if draft != "compact":
+            if staged != "compact":
                 post_return(pid)
-                time.sleep(0.20)
+                time.sleep(0.22)
 
             # Step 3: When first Return accepted the autocomplete item into `'compact '` (`clean_draft == 'compact'`),
             # re-focus the composer and press Return once more to actually execute compaction.
             comp_now, rem, cur_msg = check_composer_state(win_ref, msg_el)
             try:
                 if not comp_now and rem in COMPACT_DRAFTS:
-                    focus_composer(cur_msg)
+                    focus_composer(app_ref, win_ref, cur_msg)
                     post_return(pid)
-                    time.sleep(0.22)
+                    time.sleep(0.24)
             finally:
                 cf.CFRelease(cur_msg)
 
-            # Step 4: Fallback — if `/compact` chip is still unsubmitted, press composer's `Send message` AXButton directly
+            # Step 4: Fallback — if `/compact` chip is still unsubmitted, press composer's `Send message` AXButton
             comp_now, rem, cur_msg = check_composer_state(win_ref, msg_el)
             try:
                 if not comp_now and rem in COMPACT_DRAFTS:
@@ -434,12 +565,17 @@ def main() -> int:
                         try:
                             perform_action(send_btn, "AXPress")
                             time.sleep(0.24)
+                            comp_chk, rem_chk, chk_msg = check_composer_state(win_ref, msg_el)
+                            cf.CFRelease(chk_msg)
+                            if not comp_chk and rem_chk in COMPACT_DRAFTS and frontmost:
+                                click_element_restore_cursor(send_btn, 0.5)
+                                time.sleep(0.24)
                         finally:
                             cf.CFRelease(send_btn)
             finally:
                 cf.CFRelease(cur_msg)
 
-            # Step 5: Verify submission actually cleared the input or started `"Compacting"`
+            # Step 5: Verify submission actually cleared the input (since `staged` WAS in COMPACT_DRAFTS!)
             for _ in range(4):
                 comp_now, rem, cur_msg = check_composer_state(win_ref, msg_el)
                 cf.CFRelease(cur_msg)
@@ -450,7 +586,7 @@ def main() -> int:
             # Step 6: Never leave `/compact` stranded in the input box if composer refused submission
             _, _, cleanup_msg = check_composer_state(win_ref, msg_el)
             try:
-                clear_composer_input(pid, cleanup_msg)
+                clear_composer_input(pid, app_ref, win_ref, cleanup_msg)
             finally:
                 cf.CFRelease(cleanup_msg)
             return emit({
