@@ -15,8 +15,16 @@ import sys
 import time
 
 PLACEHOLDER = "Ask anything, @ to mention, / for actions"
+COMPACT_DRAFTS = {"/compact", "compact"}
+SEND_BUTTON_LABELS = {"send message", "send", "submit", "发送", "发送消息"}
+
 K_CF_STRING_ENCODING_UTF8 = 0x08000100
+K_CG_EVENT_SOURCE_STATE_PRIVATE = -1
+K_CG_EVENT_FLAG_MASK_COMMAND = 0x100000
+
+KEYCODE_A = 0
 KEYCODE_RETURN = 36
+KEYCODE_DELETE = 51
 
 cf = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
 ax = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
@@ -52,8 +60,11 @@ ax.AXUIElementSetAttributeValue.restype = ctypes.c_int32
 ax.AXUIElementPerformAction.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 ax.AXUIElementPerformAction.restype = ctypes.c_int32
 
+cg.CGEventSourceCreate.argtypes = [ctypes.c_int32]
+cg.CGEventSourceCreate.restype = ctypes.c_void_p
 cg.CGEventCreateKeyboardEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint16, ctypes.c_bool]
 cg.CGEventCreateKeyboardEvent.restype = ctypes.c_void_p
+cg.CGEventSetFlags.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
 cg.CGEventKeyboardSetUnicodeString.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_uint16)]
 cg.CGEventPostToPid.argtypes = [ctypes.c_int, ctypes.c_void_p]
 
@@ -118,7 +129,7 @@ def perform_action(el: int, action_name: str) -> int:
 
 
 def clean_draft(raw: str) -> str:
-    s = (raw or "").strip()
+    s = (raw or "").replace("\ufffc", "").strip()
     return "" if s == PLACEHOLDER else s
 
 
@@ -178,8 +189,8 @@ def scan_window(win_ref: int) -> tuple[int | None, bool]:
             return
         role = read_str_attr(el, "AXRole")
         if role in ("AXStaticText", "AXButton", "AXGroup"):
-            txt = f"{read_str_attr(el, 'AXValue')} {read_str_attr(el, 'AXTitle')}".strip()
-            if txt.startswith("Compacting") or "Compacting ·" in txt:
+            txt = f"{read_str_attr(el, 'AXValue')} {read_str_attr(el, 'AXTitle')} {read_str_attr(el, 'AXDescription')}".strip()
+            if txt.startswith("Compacting") or "Compacting ·" in txt or "Compacting conversation" in txt:
                 compacting = True
         elif role == "AXTextArea" and msg_el is None:
             desc = read_str_attr(el, "AXDescription")
@@ -204,46 +215,133 @@ def scan_window(win_ref: int) -> tuple[int | None, bool]:
     return msg_el, compacting
 
 
-def locate_composer(app_ref: int, title_hint: str, ws_hint: str) -> tuple[str, int | None, bool]:
-    """Locate Message input across windows, retrying briefly if Electron AX tree is waking up."""
+def locate_composer(app_ref: int, title_hint: str, ws_hint: str) -> tuple[int | None, str, int | None, bool]:
+    """Locate window and Message input across windows, retrying briefly if Electron AX tree is waking up."""
     for attempt in range(4):
         wins = ordered_windows(app_ref, title_hint, ws_hint)
+        chosen_win: int | None = None
         try:
             for w in wins:
                 win_title = read_str_attr(w, "AXTitle")
                 msg_el, compacting = scan_window(w)
                 if compacting or msg_el is not None:
-                    return win_title, msg_el, compacting
+                    chosen_win = int(cf.CFRetain(w))
+                    return chosen_win, win_title, msg_el, compacting
         finally:
             for w in wins:
                 cf.CFRelease(w)
         if attempt < 3:
             time.sleep(0.12)
-    return "", None, False
+    return None, "", None, False
+
+
+def find_send_button(msg_el: int) -> int | None:
+    """Find the Chat Composer's Send button (`AXDescription == 'Send message'`) near `msg_el`."""
+    root = int(cf.CFRetain(msg_el))
+    for _ in range(6):
+        parent = copy_attr(root, "AXParent")
+        if not parent:
+            break
+        cf.CFRelease(root)
+        root = parent
+
+    found: int | None = None
+
+    def walk(el: int, depth: int = 0) -> None:
+        nonlocal found
+        if not el or depth > 9 or found is not None:
+            return
+        if read_str_attr(el, "AXRole") == "AXButton":
+            desc = read_str_attr(el, "AXDescription").strip().lower()
+            title = read_str_attr(el, "AXTitle").strip().lower()
+            if desc in SEND_BUTTON_LABELS or title in SEND_BUTTON_LABELS:
+                found = int(cf.CFRetain(el))
+                return
+        children_ref = copy_attr(el, "AXChildren")
+        if children_ref:
+            try:
+                if cf.CFGetTypeID(children_ref) == ARR_ID:
+                    cnt = min(cf.CFArrayGetCount(children_ref), 60)
+                    for i in range(cnt):
+                        walk(cf.CFArrayGetValueAtIndex(children_ref, i), depth + 1)
+                        if found is not None:
+                            break
+            finally:
+                cf.CFRelease(children_ref)
+
+    try:
+        walk(root, 0)
+    finally:
+        cf.CFRelease(root)
+    return found
+
+
+def focus_composer(msg_el: int) -> None:
+    perform_action(msg_el, "AXPress")
+    set_attr(msg_el, "AXFocused", K_CF_BOOLEAN_TRUE)
+    time.sleep(0.04)
 
 
 def post_unicode_text(pid: int, text: str) -> None:
-    for ch in text:
-        u16 = ch.encode("utf-16-le")
-        units = (ctypes.c_uint16 * (len(u16) // 2)).from_buffer_copy(u16)
-        down = cg.CGEventCreateKeyboardEvent(None, 0, True)
-        up = cg.CGEventCreateKeyboardEvent(None, 0, False)
-        cg.CGEventKeyboardSetUnicodeString(down, len(units), units)
-        cg.CGEventKeyboardSetUnicodeString(up, len(units), units)
+    src = cg.CGEventSourceCreate(K_CG_EVENT_SOURCE_STATE_PRIVATE)
+    try:
+        for ch in text:
+            u16 = ch.encode("utf-16-le")
+            units = (ctypes.c_uint16 * (len(u16) // 2)).from_buffer_copy(u16)
+            down = cg.CGEventCreateKeyboardEvent(src, 0, True)
+            up = cg.CGEventCreateKeyboardEvent(src, 0, False)
+            cg.CGEventSetFlags(down, 0)
+            cg.CGEventSetFlags(up, 0)
+            cg.CGEventKeyboardSetUnicodeString(down, len(units), units)
+            cg.CGEventKeyboardSetUnicodeString(up, len(units), units)
+            cg.CGEventPostToPid(pid, down)
+            cg.CGEventPostToPid(pid, up)
+            cf.CFRelease(down)
+            cf.CFRelease(up)
+            time.sleep(0.008)
+    finally:
+        if src:
+            cf.CFRelease(src)
+
+
+def post_key(pid: int, keycode: int, flags: int = 0) -> None:
+    src = cg.CGEventSourceCreate(K_CG_EVENT_SOURCE_STATE_PRIVATE)
+    try:
+        down = cg.CGEventCreateKeyboardEvent(src, keycode, True)
+        up = cg.CGEventCreateKeyboardEvent(src, keycode, False)
+        cg.CGEventSetFlags(down, flags)
+        cg.CGEventSetFlags(up, flags)
         cg.CGEventPostToPid(pid, down)
         cg.CGEventPostToPid(pid, up)
         cf.CFRelease(down)
         cf.CFRelease(up)
-        time.sleep(0.008)
+    finally:
+        if src:
+            cf.CFRelease(src)
 
 
 def post_return(pid: int) -> None:
-    down = cg.CGEventCreateKeyboardEvent(None, KEYCODE_RETURN, True)
-    up = cg.CGEventCreateKeyboardEvent(None, KEYCODE_RETURN, False)
-    cg.CGEventPostToPid(pid, down)
-    cg.CGEventPostToPid(pid, up)
-    cf.CFRelease(down)
-    cf.CFRelease(up)
+    post_key(pid, KEYCODE_RETURN, 0)
+
+
+def clear_composer_input(pid: int, msg_el: int) -> None:
+    """Roll back any unsubmitted `/compact` text/chip so the user's input box stays clean."""
+    focus_composer(msg_el)
+    post_key(pid, KEYCODE_A, K_CG_EVENT_FLAG_MASK_COMMAND)
+    time.sleep(0.03)
+    post_key(pid, KEYCODE_DELETE, 0)
+    time.sleep(0.03)
+    post_key(pid, KEYCODE_DELETE, 0)
+    time.sleep(0.04)
+    set_str_attr(msg_el, "AXValue", "")
+
+
+def check_composer_state(win_ref: int, fallback_msg_el: int) -> tuple[bool, str, int]:
+    """Return `(compacting, clean_remaining_draft, retained_msg_el)`."""
+    fresh_msg, compacting = scan_window(win_ref)
+    active_msg = fresh_msg if fresh_msg is not None else int(cf.CFRetain(fallback_msg_el))
+    rem = clean_draft(read_str_attr(active_msg, "AXValue"))
+    return compacting, rem, active_msg
 
 
 def emit(obj: dict) -> int:
@@ -275,22 +373,20 @@ def main() -> int:
 
     try:
         set_attr(app_ref, "AXManualAccessibility", K_CF_BOOLEAN_TRUE)
-        win_title, msg_el, compacting = locate_composer(
+        win_ref, win_title, msg_el, compacting = locate_composer(
             app_ref,
             str(payload.get("title") or ""),
             str(payload.get("workspaceName") or ""),
         )
-        if compacting:
-            if msg_el:
-                cf.CFRelease(msg_el)
-            return emit({"ok": True, "alreadyCompacting": True, "pid": pid, "windowTitle": win_title})
-
-        if not msg_el:
-            return emit({"ok": False, "reason": "当前页面未定位到对话输入框"})
-
         try:
+            if compacting:
+                return emit({"ok": True, "alreadyCompacting": True, "pid": pid, "windowTitle": win_title})
+
+            if not win_ref or not msg_el:
+                return emit({"ok": False, "reason": "当前页面未定位到对话输入框"})
+
             draft = clean_draft(read_str_attr(msg_el, "AXValue"))
-            if draft and draft != "/compact":
+            if draft and draft not in COMPACT_DRAFTS:
                 return emit({
                     "ok": False,
                     "reason": "对话输入框中有未发送的草稿内容，请先发送或清空后再点击压缩",
@@ -306,30 +402,66 @@ def main() -> int:
                     "readyToCompact": True,
                 })
 
-            # Move focus out of the right-hand sidecar iframe into the chat composer
-            perform_action(msg_el, "AXPress")
-            set_attr(msg_el, "AXFocused", K_CF_BOOLEAN_TRUE)
-            time.sleep(0.05)
+            # Step 1: Focus composer and enter `/compact` if not already staged as `/compact` or `compact` chip
+            focus_composer(msg_el)
+            if draft not in COMPACT_DRAFTS:
+                post_unicode_text(pid, "/compact")
+                time.sleep(0.18)
 
-            if draft != "/compact":
-                set_str_attr(msg_el, "AXSelectedText", "/compact")
-                time.sleep(0.06)
-                if clean_draft(read_str_attr(msg_el, "AXValue")) != "/compact":
-                    post_unicode_text(pid, "/compact")
-                time.sleep(0.16)
-
-            post_return(pid)
-            time.sleep(0.26)
-
-            # If first Return only accepted '/compact' from the '/' autocomplete popup, press Return once more
-            rem = clean_draft(read_str_attr(msg_el, "AXValue"))
-            if rem == "/compact":
+            # Step 2: First Return (accepts `/compact` chip from `/` autocomplete menu -> AXValue becomes `'compact '`,
+            # or submits immediately if already a chip / no popup)
+            if draft != "compact":
                 post_return(pid)
                 time.sleep(0.20)
 
-            return emit({"ok": True})
+            # Step 3: When first Return accepted the autocomplete item into `'compact '` (`clean_draft == 'compact'`),
+            # re-focus the composer and press Return once more to actually execute compaction.
+            comp_now, rem, cur_msg = check_composer_state(win_ref, msg_el)
+            try:
+                if not comp_now and rem in COMPACT_DRAFTS:
+                    focus_composer(cur_msg)
+                    post_return(pid)
+                    time.sleep(0.22)
+            finally:
+                cf.CFRelease(cur_msg)
+
+            # Step 4: Fallback — if `/compact` chip is still unsubmitted, press composer's `Send message` AXButton directly
+            comp_now, rem, cur_msg = check_composer_state(win_ref, msg_el)
+            try:
+                if not comp_now and rem in COMPACT_DRAFTS:
+                    send_btn = find_send_button(cur_msg)
+                    if send_btn:
+                        try:
+                            perform_action(send_btn, "AXPress")
+                            time.sleep(0.24)
+                        finally:
+                            cf.CFRelease(send_btn)
+            finally:
+                cf.CFRelease(cur_msg)
+
+            # Step 5: Verify submission actually cleared the input or started `"Compacting"`
+            for _ in range(4):
+                comp_now, rem, cur_msg = check_composer_state(win_ref, msg_el)
+                cf.CFRelease(cur_msg)
+                if comp_now or rem not in COMPACT_DRAFTS:
+                    return emit({"ok": True, "compacting": comp_now})
+                time.sleep(0.12)
+
+            # Step 6: Never leave `/compact` stranded in the input box if composer refused submission
+            _, _, cleanup_msg = check_composer_state(win_ref, msg_el)
+            try:
+                clear_composer_input(pid, cleanup_msg)
+            finally:
+                cf.CFRelease(cleanup_msg)
+            return emit({
+                "ok": False,
+                "reason": "当前会话暂无法执行 /compact（请确认本轮回复已停止后再点击压缩）",
+            })
         finally:
-            cf.CFRelease(msg_el)
+            if msg_el:
+                cf.CFRelease(msg_el)
+            if win_ref:
+                cf.CFRelease(win_ref)
     finally:
         cf.CFRelease(app_ref)
 

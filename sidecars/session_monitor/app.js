@@ -798,8 +798,21 @@
 
   $('compact-badge').addEventListener('click', async () => {
     const cur = state.snap?.current;
+    const h = cur?.health || {};
     const cid = activeTargetConvId();
     if (!cur) return;
+
+    if (h.state === 'WAITING_APPROVAL') {
+      showToast('请先处理左侧权限确认弹窗后再点击压缩');
+      return;
+    }
+    if (['THINKING', 'THINKING_DEEP', 'TOOL_ACTIVE', 'SUBAGENT_RUNNING'].includes(h.state)) {
+      showToast('当前轮次执行中，请待停止后再点击压缩');
+      return;
+    }
+
+    $('compact-badge').blur();
+    document.activeElement?.blur?.();
 
     state.compactingConvId = cid || cur.conversationId || '';
     state.compactingBaselineCount = cur.compactCount || 0;
@@ -807,10 +820,11 @@
     renderAll();
 
     try {
-      // 若当前在面板中切到了其他会话，先让宿主主窗口切到目标会话再向输入框提交 /compact
-      if (cid && window.sidecar?.ui?.toggleConversation) {
+      // 仅当用户在面板中手动切到了另一个会话时，才通知宿主切到目标会话；已在当前会话时绝不重复调用 toggleConversation
+      const hostConvId = state.snap?.conversationId || window.sidecar?.conversationId || '';
+      if (state.overrideConvId && cid && cid !== hostConvId && window.sidecar?.ui?.toggleConversation) {
         window.sidecar.ui.toggleConversation(cid);
-        await new Promise((r) => setTimeout(r, 220));
+        await new Promise((r) => setTimeout(r, 300));
       }
       const res = await apiPost('/api/compact', {
         conversationId: cid,
