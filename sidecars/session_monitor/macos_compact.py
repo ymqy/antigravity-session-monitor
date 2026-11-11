@@ -49,6 +49,8 @@ ax.AXUIElementCopyAttributeValue.argtypes = [ctypes.c_void_p, ctypes.c_void_p, c
 ax.AXUIElementCopyAttributeValue.restype = ctypes.c_int32
 ax.AXUIElementSetAttributeValue.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
 ax.AXUIElementSetAttributeValue.restype = ctypes.c_int32
+ax.AXUIElementPerformAction.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+ax.AXUIElementPerformAction.restype = ctypes.c_int32
 
 cg.CGEventCreateKeyboardEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint16, ctypes.c_bool]
 cg.CGEventCreateKeyboardEvent.restype = ctypes.c_void_p
@@ -99,6 +101,22 @@ def set_attr(el: int, name: str, val_ref: int | ctypes.c_void_p) -> int:
         cf.CFRelease(key)
 
 
+def set_str_attr(el: int, name: str, text: str) -> int:
+    val = cfstr(text)
+    try:
+        return set_attr(el, name, val)
+    finally:
+        cf.CFRelease(val)
+
+
+def perform_action(el: int, action_name: str) -> int:
+    act = cfstr(action_name)
+    try:
+        return int(ax.AXUIElementPerformAction(el, act))
+    finally:
+        cf.CFRelease(act)
+
+
 def clean_draft(raw: str) -> str:
     s = (raw or "").strip()
     return "" if s == PLACEHOLDER else s
@@ -119,28 +137,33 @@ def find_antigravity_pid() -> int | None:
     return None
 
 
-def pick_window(app_ref: int, title_hint: str, ws_hint: str) -> int | None:
+def ordered_windows(app_ref: int, title_hint: str, ws_hint: str) -> list[int]:
     wins_ref = copy_attr(app_ref, "AXWindows")
-    if not wins_ref or cf.CFGetTypeID(wins_ref) != ARR_ID:
-        if wins_ref:
-            cf.CFRelease(wins_ref)
-        return None
+    if not wins_ref:
+        return []
+    if cf.CFGetTypeID(wins_ref) != ARR_ID:
+        cf.CFRelease(wins_ref)
+        return []
 
     try:
         count = cf.CFArrayGetCount(wins_ref)
         if count <= 0:
-            return None
+            return []
         th = (title_hint or "").strip().lower()
         wh = (ws_hint or "").strip().lower()
-        chosen = cf.CFArrayGetValueAtIndex(wins_ref, 0)
-        if count > 1 and (th or wh):
-            for i in range(count):
-                w = cf.CFArrayGetValueAtIndex(wins_ref, i)
-                wt = read_str_attr(w, "AXTitle").lower()
-                if (th and th[:14] in wt) or (wh and wh in wt):
-                    chosen = w
-                    break
-        return int(cf.CFRetain(chosen)) if chosen else None
+        matched: list[int] = []
+        others: list[int] = []
+        for i in range(count):
+            w = cf.CFArrayGetValueAtIndex(wins_ref, i)
+            if not w:
+                continue
+            wt = read_str_attr(w, "AXTitle").lower()
+            retained = int(cf.CFRetain(w))
+            if (th and th[:14] in wt) or (wh and wh in wt):
+                matched.append(retained)
+            else:
+                others.append(retained)
+        return matched + others
     finally:
         cf.CFRelease(wins_ref)
 
@@ -181,6 +204,24 @@ def scan_window(win_ref: int) -> tuple[int | None, bool]:
     return msg_el, compacting
 
 
+def locate_composer(app_ref: int, title_hint: str, ws_hint: str) -> tuple[str, int | None, bool]:
+    """Locate Message input across windows, retrying briefly if Electron AX tree is waking up."""
+    for attempt in range(4):
+        wins = ordered_windows(app_ref, title_hint, ws_hint)
+        try:
+            for w in wins:
+                win_title = read_str_attr(w, "AXTitle")
+                msg_el, compacting = scan_window(w)
+                if compacting or msg_el is not None:
+                    return win_title, msg_el, compacting
+        finally:
+            for w in wins:
+                cf.CFRelease(w)
+        if attempt < 3:
+            time.sleep(0.12)
+    return "", None, False
+
+
 def post_unicode_text(pid: int, text: str) -> None:
     for ch in text:
         u16 = ch.encode("utf-16-le")
@@ -211,16 +252,18 @@ def emit(obj: dict) -> int:
 
 
 def main() -> int:
+    dry_run = "--dry-run" in sys.argv[1:]
     if not ax.AXIsProcessTrusted():
         return emit({"ok": False, "reason": "请在系统设置 → 隐私与安全性 → 辅助功能中授予 Antigravity 权限"})
 
     payload = {}
-    try:
-        raw = sys.stdin.read().strip()
-        if raw:
-            payload = json.loads(raw)
-    except Exception:
-        payload = {}
+    if not sys.stdin.isatty():
+        try:
+            raw = sys.stdin.read().strip()
+            if raw:
+                payload = json.loads(raw)
+        except Exception:
+            payload = {}
 
     pid = find_antigravity_pid()
     if not pid:
@@ -231,51 +274,62 @@ def main() -> int:
         return emit({"ok": False, "reason": "无法连接客户端辅助功能接口"})
 
     try:
-        # Ensure Chromium/Electron accessibility tree is awake
         set_attr(app_ref, "AXManualAccessibility", K_CF_BOOLEAN_TRUE)
-        win_ref = pick_window(app_ref, str(payload.get("title") or ""), str(payload.get("workspaceName") or ""))
-        if not win_ref:
-            return emit({"ok": False, "reason": "未找到可用的对话窗口"})
+        win_title, msg_el, compacting = locate_composer(
+            app_ref,
+            str(payload.get("title") or ""),
+            str(payload.get("workspaceName") or ""),
+        )
+        if compacting:
+            if msg_el:
+                cf.CFRelease(msg_el)
+            return emit({"ok": True, "alreadyCompacting": True, "pid": pid, "windowTitle": win_title})
+
+        if not msg_el:
+            return emit({"ok": False, "reason": "当前页面未定位到对话输入框"})
 
         try:
-            msg_el, compacting = scan_window(win_ref)
-            if compacting:
-                if msg_el:
-                    cf.CFRelease(msg_el)
-                return emit({"ok": True, "alreadyCompacting": True})
+            draft = clean_draft(read_str_attr(msg_el, "AXValue"))
+            if draft and draft != "/compact":
+                return emit({
+                    "ok": False,
+                    "reason": "对话输入框中有未发送的草稿内容，请先发送或清空后再点击压缩",
+                })
 
-            if not msg_el:
-                return emit({"ok": False, "reason": "当前页面未定位到对话输入框"})
+            if dry_run:
+                return emit({
+                    "ok": True,
+                    "dryRun": True,
+                    "pid": pid,
+                    "windowTitle": win_title,
+                    "draft": draft,
+                    "readyToCompact": True,
+                })
 
-            try:
-                draft = clean_draft(read_str_attr(msg_el, "AXValue"))
-                if draft and draft != "/compact":
-                    return emit({
-                        "ok": False,
-                        "reason": "对话输入框中有未发送的草稿内容，请先发送或清空后再点击压缩",
-                    })
+            # Move focus out of the right-hand sidecar iframe into the chat composer
+            perform_action(msg_el, "AXPress")
+            set_attr(msg_el, "AXFocused", K_CF_BOOLEAN_TRUE)
+            time.sleep(0.05)
 
-                set_attr(msg_el, "AXFocused", K_CF_BOOLEAN_TRUE)
-                time.sleep(0.04)
-
-                if draft != "/compact":
+            if draft != "/compact":
+                set_str_attr(msg_el, "AXSelectedText", "/compact")
+                time.sleep(0.06)
+                if clean_draft(read_str_attr(msg_el, "AXValue")) != "/compact":
                     post_unicode_text(pid, "/compact")
-                    time.sleep(0.16)
+                time.sleep(0.16)
 
+            post_return(pid)
+            time.sleep(0.26)
+
+            # If first Return only accepted '/compact' from the '/' autocomplete popup, press Return once more
+            rem = clean_draft(read_str_attr(msg_el, "AXValue"))
+            if rem == "/compact":
                 post_return(pid)
-                time.sleep(0.26)
+                time.sleep(0.20)
 
-                # If first Return selected '/compact' from the '/' autocomplete menu, press Return once more
-                rem = clean_draft(read_str_attr(msg_el, "AXValue"))
-                if rem == "/compact":
-                    post_return(pid)
-                    time.sleep(0.20)
-
-                return emit({"ok": True})
-            finally:
-                cf.CFRelease(msg_el)
+            return emit({"ok": True})
         finally:
-            cf.CFRelease(win_ref)
+            cf.CFRelease(msg_el)
     finally:
         cf.CFRelease(app_ref)
 

@@ -34,7 +34,7 @@ export function normalizeSettings(raw) {
     compactHintContextTokens: clamp(
       s.compactHintContextTokens,
       DEFAULT_SETTINGS.compactHintContextTokens,
-      50000,
+      10000,
       800000,
     ),
   };
