@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" fill="none">
+  <defs>
+    <linearGradient id="pulseBg" x1="14" y1="14" x2="114" y2="114" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0F172A"/>
+      <stop offset="55%" stop-color="#11243E"/>
+      <stop offset="100%" stop-color="#0D3B4C"/>
+    </linearGradient>
+    <linearGradient id="pulseLine" x1="24" y1="64" x2="104" y2="64" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="50%" stop-color="#34D399"/>
+      <stop offset="100%" stop-color="#A7F3D0"/>
+    </linearGradient>
+  </defs>
+  <rect x="14" y="14" width="100" height="100" rx="24" fill="url(#pulseBg)" stroke="#38BDF8" stroke-opacity="0.45" stroke-width="2.5"/>
+  <circle cx="94" cy="34" r="6" fill="#34D399"/>
+  <circle cx="94" cy="34" r="11" stroke="#34D399" stroke-opacity="0.35" stroke-width="2"/>
+  <path d="M26 68H43L52 44L64 86L75 54L83 68H102" stroke="url(#pulseLine)" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="30" y="94" width="68" height="6" rx="3" fill="#1E293B"/>
+  <rect x="30" y="94" width="46" height="6" rx="3" fill="#34D399"/>
+</svg>

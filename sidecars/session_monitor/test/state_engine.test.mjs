@@ -1,0 +1,413 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import {
+  buildCompactHint,
+  DEFAULT_SETTINGS,
+  evaluateConversationHealth,
+  matchActiveProcess,
+  parseMilestoneMarkdown,
+  parsePsOutput,
+  parseTranscript,
+} from '../state_engine.mjs';
+
+test('parseMilestoneMarkdown extracts done, active [/], and pending [ ] items accurately', () => {
+  const md = `# Task Pulse 开发进度清单
+
+- [x] 阶段 1：插件底座
+- [/] 阶段 2：状态机实现
+- [ ] 阶段 3：前端面板
+- [ ] 阶段 4：联调挂载
+`;
+  const res = parseMilestoneMarkdown(md, 'task.md', '/tmp/task.md');
+  assert.ok(res);
+  assert.equal(res.total, 4);
+  assert.equal(res.done, 1);
+  assert.equal(res.activeCount, 1);
+  assert.equal(res.percent, 25);
+  assert.equal(res.currentText, '阶段 2：状态机实现');
+});
+
+test('matchActiveProcess aggregates subtree CPU% across parent sh and child worker PIDs', () => {
+  const psSample = `
+  100     1   0.0 10:00 /sbin/launchd
+  500   100   0.0 00:45 /bin/zsh -c npm test -- --watchAll=false
+  501   500   2.5 00:44 node /repo/node_modules/.bin/jest
+  502   501  84.3 00:43 node /repo/node_modules/jest-worker/build/workers/processChild.js
+`;
+  const rows = parsePsOutput(psSample);
+  assert.equal(rows.length, 4);
+
+  const matched = matchActiveProcess(rows, {
+    commandLine: 'npm test -- --watchAll=false',
+    workspacePaths: ['/repo'],
+    ownPid: 9999,
+  });
+  assert.ok(matched);
+  assert.equal(matched.pid, 500);
+  assert.equal(matched.cpu, 86.8);
+  assert.equal(matched.processCount, 3);
+});
+
+test('evaluateConversationHealth transitions THINKING -> THINKING_DEEP (>60s) -> STUCK_SUSPECTED (>180s)', () => {
+  const baseStart = 1_700_000_000_000;
+  const hookState = {
+    phase: 'thinking',
+    turnStartedAt: baseStart,
+    invocationStartedAt: baseStart,
+    invocationNum: 3,
+    modelName: 'Gemini 4 Carbon (High)',
+  };
+
+  // 25s -> healthy THINKING
+  const h1 = evaluateConversationHealth({
+    now: baseStart + 25_000,
+    hookState,
+    settings: DEFAULT_SETTINGS,
+  });
+  assert.equal(h1.state, 'THINKING');
+  assert.equal(h1.severity, 'healthy');
+  assert.equal(h1.alertKey, null);
+
+  // 75s -> caution THINKING_DEEP (no false hang alert!)
+  const h2 = evaluateConversationHealth({
+    now: baseStart + 75_000,
+    hookState,
+    settings: DEFAULT_SETTINGS,
+  });
+  assert.equal(h2.state, 'THINKING_DEEP');
+  assert.equal(h2.severity, 'caution');
+  assert.equal(h2.alertKey, null);
+
+  // 195s -> warning STUCK_SUSPECTED + macOS alertKey
+  const h3 = evaluateConversationHealth({
+    now: baseStart + 195_000,
+    hookState,
+    settings: DEFAULT_SETTINGS,
+  });
+  assert.equal(h3.state, 'STUCK_SUSPECTED');
+  assert.equal(h3.severity, 'warning');
+  assert.ok(h3.alertKey);
+});
+
+test('evaluateConversationHealth distinguishes active CPU command (never stuck) vs 0% CPU hung vs waiting approval', () => {
+  const t0 = Date.parse('2026-11-11T10:00:00Z');
+  const lines = [
+    JSON.stringify({
+      step_index: 0,
+      type: 'USER_INPUT',
+      created_at: '2026-11-11T10:00:00Z',
+      content: '<USER_REQUEST>Run full test suite</USER_REQUEST>',
+    }),
+    JSON.stringify({
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-11T10:00:05Z',
+      input_tokens: 12000,
+      cache_read_tokens: 24000,
+      output_tokens: 400,
+      thinking: '**Executing Test Suite**\nRunning pytest now.',
+      tool_calls: [
+        {
+          name: 'run_command',
+          args: { CommandLine: '"pytest tests/slow_suite.py"', toolSummary: '"Run pytest slow suite"' },
+        },
+      ],
+    }),
+  ].join('\n');
+
+  const tr = parseTranscript(lines, t0 + 6_000);
+  assert.equal(tr.pendingTools.length, 1);
+  assert.equal(tr.tokens.currentContext, 36000);
+
+  // Case A: 20s elapsed, NO OS process spawned -> WAITING_USER (likely waiting on permission prompt!)
+  const waitApproval = evaluateConversationHealth({
+    now: t0 + 28_000,
+    transcript: tr,
+    proc: null,
+    settings: DEFAULT_SETTINGS,
+  });
+  assert.equal(waitApproval.state, 'WAITING_USER');
+  assert.equal(waitApproval.badge, '等待权限确认');
+
+  // Case B: 300s (5 min!) elapsed, but OS process has 45.2% CPU -> stays healthy TOOL_ACTIVE!
+  const activeCpu = evaluateConversationHealth({
+    now: t0 + 306_000,
+    transcript: tr,
+    proc: { pid: 1234, cpu: 45.2, command: 'pytest tests/slow_suite.py' },
+    settings: DEFAULT_SETTINGS,
+  });
+  assert.equal(activeCpu.state, 'TOOL_ACTIVE');
+  assert.equal(activeCpu.severity, 'healthy');
+  assert.equal(activeCpu.alertKey, null);
+
+  // Case C: 110s elapsed, OS process exists with 0.0% CPU -> STUCK_SUSPECTED!
+  const hungCmd = evaluateConversationHealth({
+    now: t0 + 116_000,
+    transcript: tr,
+    proc: { pid: 1234, cpu: 0.0, command: 'pytest tests/slow_suite.py' },
+    settings: DEFAULT_SETTINGS,
+  });
+  assert.equal(hungCmd.state, 'STUCK_SUSPECTED');
+  assert.equal(hungCmd.badge, '命令疑似挂起');
+  assert.ok(hungCmd.alertKey);
+});
+
+test('parseTranscript extracts subagent conversationId and evaluates SUBAGENT_RUNNING', () => {
+  const lines = [
+    JSON.stringify({
+      step_index: 0,
+      type: 'USER_INPUT',
+      created_at: '2026-11-11T10:00:00Z',
+      content: '<USER_REQUEST>Audit architecture</USER_REQUEST>',
+    }),
+    JSON.stringify({
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-11T10:00:02Z',
+      tool_calls: [
+        {
+          name: 'invoke_subagent',
+          args: { TypeName: '"scout"', Role: '"Architecture Researcher"', Prompt: '"Scan modules"' },
+        },
+      ],
+    }),
+    JSON.stringify({
+      step_index: 2,
+      type: 'GENERIC',
+      status: 'DONE',
+      created_at: '2026-11-11T10:00:04Z',
+      content: 'Created At: 2026-11-11T18:00:03+08:00\nCompleted At: 2026-11-11T18:00:04+08:00\nCreated the following subagent:\n{\n  "conversationId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"\n}',
+    }),
+    JSON.stringify({
+      step_index: 3,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-11T10:00:05Z',
+      content: 'Subagent launched, waiting for findings.',
+      tool_calls: [],
+    }),
+  ].join('\n');
+
+  const tr = parseTranscript(lines, Date.parse('2026-11-11T10:00:05Z'));
+  assert.equal(tr.subagentRefs.length, 1);
+  assert.equal(tr.subagentRefs[0].conversationId, 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
+  assert.equal(tr.subagentRefs[0].role, 'Architecture Researcher');
+
+  const health = evaluateConversationHealth({
+    now: Date.parse('2026-11-11T10:00:20Z'),
+    hookState: {
+      phase: 'stopped',
+      turnStartedAt: Date.parse('2026-11-11T10:00:00Z'),
+      stop: { terminationReason: 'NO_TOOL_CALL', fullyIdle: false, stoppedAt: Date.parse('2026-11-11T10:00:06Z') },
+    },
+    transcript: tr,
+    subagents: [
+      {
+        conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+        role: 'Architecture Researcher',
+        state: 'TOOL_ACTIVE',
+        severity: 'healthy',
+        badge: '工具执行中',
+        headline: '读取 index.mjs',
+        elapsedSec: 14,
+        startedAtMs: Date.parse('2026-11-11T10:00:06Z'),
+        stepCount: 7,
+        isRunning: true,
+      },
+    ],
+  });
+  assert.equal(health.state, 'SUBAGENT_RUNNING');
+  assert.match(health.badge, /1 个子代理运行中/);
+});
+
+test('parseTranscript & evaluateConversationHealth handle stream interruption without false stuck tool', () => {
+  const t0 = Date.parse('2026-11-11T10:59:00Z');
+  const lines = [
+    JSON.stringify({
+      step_index: 140,
+      type: 'USER_INPUT',
+      created_at: '2026-11-11T10:59:00Z',
+      content: '<USER_REQUEST>插件里文案都用中文</USER_REQUEST>',
+    }),
+    JSON.stringify({
+      step_index: 144,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-11T10:59:15Z',
+      tool_calls: [
+        {
+          name: 'write_file',
+          args: { Path: '"/repo/sidecars/session_monitor/index.html"', Content: '"<html></html>"' },
+        },
+      ],
+    }),
+    JSON.stringify({
+      step_index: 145,
+      type: 'ERROR_MESSAGE',
+      created_at: '2026-11-11T10:59:19Z',
+      error: 'The stream was interrupted. Please continue the task you were working on.',
+    }),
+  ].join('\n');
+
+  const tr = parseTranscript(lines, t0 + 19_000);
+  // write_file must NOT remain in pendingTools once Step #145 ERROR_MESSAGE follows!
+  assert.equal(tr.pendingTools.length, 0);
+  const plannerRound = tr.rounds.find((r) => r.kind === 'planner');
+  assert.equal(plannerRound.tools[0].status, 'INTERRUPTED');
+  assert.match(tr.latestErrorStep.error, /模型输出流意外中断/);
+
+  // Even if Stop hook never ran on transport drop, >=12s after error transitions to ERROR_STOPPED ('流传输中断')
+  const hookDuringStream = {
+    phase: 'thinking',
+    turnStartedAt: t0,
+    invocationStartedAt: t0 + 10_000,
+    invocationNum: 2,
+  };
+
+  const retrySoon = evaluateConversationHealth({
+    now: t0 + 24_000, // 5s after error
+    hookState: hookDuringStream,
+    transcript: tr,
+  });
+  assert.equal(retrySoon.state, 'RETRYING');
+
+  const haltedAfterDrop = evaluateConversationHealth({
+    now: t0 + 40_000, // 21s after error with no new invocation
+    hookState: hookDuringStream,
+    transcript: tr,
+  });
+  assert.equal(haltedAfterDrop.state, 'ERROR_STOPPED');
+  assert.equal(haltedAfterDrop.badge, '流传输中断');
+  assert.ok(haltedAfterDrop.alertKey);
+});
+
+test('parseTranscript computes accurate per-round and task-level Token/s (tokenSpeed)', () => {
+  const tStart = Date.parse('2026-11-11T11:10:00Z');
+  const lines = [
+    JSON.stringify({
+      step_index: 0,
+      type: 'USER_INPUT',
+      created_at: '2026-11-11T11:10:00Z',
+      content: '<USER_REQUEST>还要看到每个任务的 token生成速度</USER_REQUEST>',
+    }),
+    // Round 1: 600 output tokens in 10s (11:10:00Z -> 11:10:10Z) => 60.0 Token/s
+    JSON.stringify({
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-11T11:10:00Z',
+      input_tokens: 10000,
+      output_tokens: 600,
+      tool_calls: [{ name: 'read_file', args: { Path: '"/repo/main.mjs"' } }],
+    }),
+    JSON.stringify({
+      step_index: 2,
+      type: 'GENERIC',
+      status: 'DONE',
+      created_at: '2026-11-11T11:10:10Z',
+      content: 'Created At: 2026-11-11T19:10:10+08:00\nCompleted At: 2026-11-11T19:10:11+08:00\nok',
+    }),
+    // Round 2 (final reply, no tool calls): 1000 output tokens in 12.5s via hook PreInvocation -> Stop => 80.0 Token/s
+    JSON.stringify({
+      step_index: 3,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-11T11:10:12Z',
+      input_tokens: 12000,
+      output_tokens: 1000,
+      content: '已完成开发',
+    }),
+  ].join('\n');
+
+  const hookState = {
+    recentHookEvents: [
+      { event: 'PreInvocation', ts: tStart + 12_000, invocationNum: 2 },
+      { event: 'Stop', ts: tStart + 24_500, terminationReason: 'NO_TOOL_CALL' },
+    ],
+    stop: { stoppedAt: tStart + 24_500, terminationReason: 'NO_TOOL_CALL' },
+  };
+
+  const tr = parseTranscript(lines, tStart + 24_500, hookState);
+  assert.equal(tr.rounds.length, 2);
+  assert.equal(tr.rounds[0].tps, 60.0);
+  assert.equal(tr.rounds[1].tps, 80.0);
+  assert.equal(tr.tokenSpeed.latestTps, 80.0);
+  assert.equal(tr.tokenSpeed.peakTps, 80.0);
+  // Weighted avg: (600 + 1000) / (10s + 12.5s) = 1600 / 22.5 = 71.1 Token/s
+  assert.equal(tr.tokenSpeed.avgTps, 71.1);
+  assert.equal(tr.tokenSpeed.measuredRounds, 2);
+});
+
+test('buildCompactHint uses active context window tokens (currentContext) as the core indicator', () => {
+  // 即使有 300 步，只要当前上下文占用仅 4.5万 t，就不需要压缩
+  assert.equal(buildCompactHint({ stepCount: 300, currentContext: 45_000 }), null);
+
+  // 刚完成压缩（累计 420 步，但上下文已回落至 2.2万 t）：不提示
+  assert.equal(buildCompactHint({ stepCount: 420, currentContext: 22_000 }), null);
+
+  // 上下文达到 16万～20万 t：触发 gentle 轻提示（“建议压缩”）
+  const gentle = buildCompactHint({ stepCount: 60, currentContext: 175_000 });
+  assert.ok(gentle);
+  assert.equal(gentle.needed, true);
+  assert.equal(gentle.level, 'gentle');
+  assert.equal(gentle.label, '建议压缩');
+  assert.match(gentle.message, /17\.5万 t/);
+
+  // 上下文逼近 ~26万 自动压缩上限（>= 20万 t）：触发 strong 提示（“立即压缩”）
+  const strong = buildCompactHint({ stepCount: 85, currentContext: 218_000 });
+  assert.ok(strong);
+  assert.equal(strong.level, 'strong');
+  assert.equal(strong.label, '立即压缩');
+  assert.match(strong.message, /21\.8万 t/);
+});
+
+test('parseTranscript drops currentContext after SYSTEM CHECKPOINT so compact hint clears naturally', () => {
+  const lines = [
+    JSON.stringify({
+      step_index: 0,
+      type: 'USER_INPUT',
+      created_at: '2026-11-11T10:00:00Z',
+      content: '<USER_REQUEST>\n/grill-me 实现会话监控面板\n</USER_REQUEST>',
+    }),
+    JSON.stringify({
+      step_index: 200,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-11T11:00:00Z',
+      input_tokens: 8000,
+      cache_read_tokens: 248000,
+      output_tokens: 500,
+    }),
+    JSON.stringify({
+      step_index: 201,
+      source: 'SYSTEM',
+      type: 'CHECKPOINT',
+      created_at: '2026-11-11T11:01:00Z',
+      input_tokens: 3000,
+      cache_read_tokens: 256000,
+      output_tokens: 1200,
+      content: '# Resuming from a compaction',
+    }),
+    JSON.stringify({
+      step_index: 202,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-11T11:01:15Z',
+      input_tokens: 21500,
+      cache_read_tokens: 0,
+      output_tokens: 320,
+      content: '继续执行任务',
+    }),
+  ].join('\n');
+
+  const tr = parseTranscript(lines, Date.parse('2026-11-11T11:01:20Z'));
+  assert.equal(tr.titleCandidate, '实现会话监控面板');
+  assert.equal(tr.stepCount, 203);
+  assert.equal(tr.compactCount, 1);
+  assert.equal(tr.stepsSinceCompact, 1);
+  assert.equal(tr.tokens.currentContext, 21500);
+  assert.equal(
+    buildCompactHint({
+      stepCount: tr.stepCount,
+      stepsSinceCompact: tr.stepsSinceCompact,
+      compactCount: tr.compactCount,
+      currentContext: tr.tokens.currentContext,
+    }),
+    null,
+  );
+});
+

@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>会话监控</title>
+  <script src="/preload.js"></script>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <!-- 顶部极简导航栏 -->
+    <header class="topbar">
+      <div class="topbar-row">
+        <div class="brand-group">
+          <span class="brand-name">会话监控</span>
+          <span id="ws-tag" class="ws-tag hidden"></span>
+        </div>
+
+        <div class="topbar-right">
+          <nav class="seg-tabs" role="tablist" aria-label="视图切换">
+            <button type="button" role="tab" id="tab-btn-overview" class="seg-tab active" data-tab="overview" aria-selected="true">
+              总览
+            </button>
+            <button type="button" role="tab" id="tab-btn-timeline" class="seg-tab" data-tab="timeline" aria-selected="false">
+              轨迹 <span id="timeline-count" class="seg-count">0</span>
+            </button>
+          </nav>
+
+          <button id="btn-copy-diag" type="button" class="icon-btn" title="复制当前诊断快照" aria-label="复制诊断快照">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="5.5" y="5.5" width="8.5" height="8.5" rx="1.8"></rect>
+              <path d="M10.5 5.5V3.8A1.8 1.8 0 0 0 8.7 2H3.8A1.8 1.8 0 0 0 2 3.8v4.9a1.8 1.8 0 0 0 1.8 1.8h1.7"></path>
+            </svg>
+          </button>
+
+          <button id="btn-settings" type="button" class="icon-btn" title="配置预警阈值" aria-label="阈值设置" aria-expanded="false">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="8" cy="8" r="2.3"></circle>
+              <path d="M13.4 9.6a1.2 1.2 0 0 0 .24 1.32l.04.04a1.45 1.45 0 1 1-2.05 2.05l-.04-.04a1.2 1.2 0 0 0-1.32-.24 1.2 1.2 0 0 0-.73 1.1v.12a1.45 1.45 0 1 1-2.9 0v-.06a1.2 1.2 0 0 0-.78-1.1 1.2 1.2 0 0 0-1.32.24l-.04.04a1.45 1.45 0 1 1-2.05-2.05l.04-.04a1.2 1.2 0 0 0 .24-1.32 1.2 1.2 0 0 0-1.1-.73h-.12a1.45 1.45 0 1 1 0-2.9h.06a1.2 1.2 0 0 0 1.1-.78 1.2 1.2 0 0 0-.24-1.32l-.04-.04a1.45 1.45 0 1 1 2.05-2.05l.04.04a1.2 1.2 0 0 0 1.32.24h.06a1.2 1.2 0 0 0 .73-1.1v-.12a1.45 1.45 0 1 1 2.9 0v.06a1.2 1.2 0 0 0 .73 1.1 1.2 1.2 0 0 0 1.32-.24l.04-.04a1.45 1.45 0 1 1 2.05 2.05l-.04.04a1.2 1.2 0 0 0-.24 1.32v.06a1.2 1.2 0 0 0 1.1.73h.12a1.45 1.45 0 1 1 0 2.9h-.06a1.2 1.2 0 0 0-1.1.73z"></path>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- 会话原始主题行 -->
+      <div class="conv-strip">
+        <span id="conv-title" class="conv-title" title="">正在连接当前会话…</span>
+        <button id="btn-back-own" type="button" class="text-btn hidden" title="切回当前窗口关联会话">返回本窗</button>
+      </div>
+
+      <!-- 预警阈值折叠抽屉 -->
+      <section id="drawer-settings" class="drawer hidden" aria-label="预警阈值设置">
+        <div class="drawer-header">
+          <span class="drawer-title">防卡死预警阈值</span>
+          <button id="btn-reset-settings" type="button" class="text-btn">恢复默认</button>
+        </div>
+        <form id="settings-form" class="settings-grid">
+          <label class="field">
+            <span>长思考转黄提示（s）</span>
+            <input id="set-think-warn" type="number" min="15" max="600" step="5">
+          </label>
+          <label class="field">
+            <span>思考超时告警（s）</span>
+            <input id="set-think-stuck" type="number" min="30" max="1800" step="10">
+          </label>
+          <label class="field">
+            <span>命令零占用挂起告警（s）</span>
+            <input id="set-cmd-stuck" type="number" min="20" max="1800" step="10">
+          </label>
+          <label class="field">
+            <span>压缩提示水位（万 t）</span>
+            <input id="set-compact-ctx" type="number" min="5" max="80" step="1">
+          </label>
+          <div class="settings-actions">
+            <button type="submit" class="primary-btn sm">保存</button>
+          </div>
+        </form>
+      </section>
+    </header>
+
+    <!-- 主内容滚动区 -->
+    <main class="viewport">
+      <!-- 视图一：总览（严格三层主次结构） -->
+      <section id="view-overview" class="tab-panel active" role="tabpanel">
+        <!-- 一级视觉重心：当前会话实时状态与核心指标 -->
+        <article id="hero-card" class="hero-card sev-idle">
+          <div class="hero-head">
+            <div class="hero-state-wrap">
+              <span id="hero-dot" class="pulse-dot st-idle" aria-hidden="true"></span>
+              <h1 id="hero-state-title" class="hero-state-title">空闲待命</h1>
+              <span id="hero-cpu" class="cpu-tag hidden">CPU 0%</span>
+              <button id="compact-badge" type="button" class="compact-tag hidden" title="">建议压缩</button>
+            </div>
+            <div id="hero-timer" class="hero-timer hidden" title="当前步骤持续耗时">00:00</div>
+          </div>
+
+          <p id="hero-headline" class="hero-action">等待发送任务指令</p>
+          <p id="hero-detail" class="hero-subdetail hidden"></p>
+
+          <!-- 三栏核心遥测指标（无多余胶囊边框） -->
+          <div class="metrics-strip">
+            <div id="metric-speed-box" class="metric-cell" title="">
+              <span class="metric-label">生成速度</span>
+              <strong id="metric-tps" class="metric-val tabular">—</strong>
+              <span id="metric-tps-sub" class="metric-sub tabular">等待测速</span>
+            </div>
+            <div id="metric-steps-box" class="metric-cell" title="">
+              <span class="metric-label">本轮耗时</span>
+              <strong id="metric-dur" class="metric-val tabular">0s</strong>
+              <span id="metric-steps" class="metric-sub tabular">累计 0 步</span>
+            </div>
+            <div id="metric-tok-box" class="metric-cell" title="">
+              <span class="metric-label">上下文</span>
+              <strong id="metric-ctx" class="metric-val tabular">0</strong>
+              <span id="metric-out" class="metric-sub tabular">输出 0</span>
+            </div>
+          </div>
+
+          <!-- 异常/阻塞时按需出现的干预栏（正常运行时完全隐藏） -->
+          <div id="hero-intervene" class="intervene-bar hidden">
+            <div class="intervene-actions">
+              <button id="btn-toggle-nudge" type="button" class="ghost-btn sm">发消息唤醒 / 追问</button>
+            </div>
+            <div id="nudge-box" class="nudge-box hidden">
+              <textarea id="nudge-input" rows="2" placeholder="输入发送给当前会话的提醒或追问…">请从刚才中断或阻塞的步骤继续推进；若有命令等待或异常，请汇报状态并继续完成任务。</textarea>
+              <div class="nudge-actions">
+                <span class="nudge-hint">通过客户端会话通道发送</span>
+                <button id="btn-cancel-nudge" type="button" class="ghost-btn sm">取消</button>
+                <button id="btn-send-nudge" type="button" class="primary-btn sm">发送</button>
+              </div>
+            </div>
+          </div>
+        </article>
+
+        <!-- 二级信息 A：阶段进度（无清单自动隐藏；100% 完成自动折叠为单行） -->
+        <section id="milestone-section" class="sec-block hidden">
+          <div id="ms-header" class="sec-head clickable" title="点击展开或收起阶段明细">
+            <div class="sec-title-group">
+              <span id="ms-done-icon" class="ms-done-icon hidden">✓</span>
+              <span class="sec-title">阶段进度</span>
+              <span id="ms-counter" class="sec-meta tabular">0/0</span>
+            </div>
+            <div class="sec-right">
+              <button id="btn-open-ms" type="button" class="link-btn hidden">文档 ↗</button>
+              <button id="btn-toggle-ms" type="button" class="subtle-btn">收起</button>
+            </div>
+          </div>
+
+          <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100">
+            <div id="ms-bar-done" class="progress-fill-done" style="width: 0%"></div>
+            <div id="ms-bar-active" class="progress-fill-active" style="width: 0%"></div>
+          </div>
+
+          <div id="ms-body" class="ms-body">
+            <ul id="ms-list" class="ms-list"></ul>
+          </div>
+        </section>
+
+        <!-- 二级信息 B：并发子代理与后台任务（数量为 0 时完全隐藏） -->
+        <section id="subagents-section" class="sec-block hidden">
+          <div class="sec-head">
+            <div class="sec-title-group">
+              <span class="sec-title">并发子代理与后台任务</span>
+              <span id="sub-count" class="sec-meta tabular">0</span>
+            </div>
+          </div>
+          <div id="sub-list" class="flat-list"></div>
+        </section>
+
+        <!-- 三级背景：本机其他并行任务（扁平分隔列表，运行中优先，已结束默认收起） -->
+        <section id="parallel-section" class="sec-block hidden">
+          <div id="parallel-active-wrap" class="hidden">
+            <div class="sec-head">
+              <div class="sec-title-group">
+                <span class="sec-title">其他运行中任务</span>
+                <span id="parallel-active-count" class="sec-meta tabular">0</span>
+              </div>
+            </div>
+            <div id="parallel-active-list" class="flat-list"></div>
+          </div>
+
+          <div id="parallel-idle-wrap" class="idle-sessions-wrap hidden">
+            <button id="btn-toggle-idle" type="button" class="idle-toggle-btn">
+              <span id="idle-toggle-label">近期已结束会话 (0)</span>
+              <span id="idle-toggle-arrow">▸</span>
+            </button>
+            <div id="parallel-idle-list" class="flat-list hidden"></div>
+          </div>
+        </section>
+      </section>
+
+      <!-- 视图二：执行轨迹 -->
+      <section id="view-timeline" class="tab-panel" role="tabpanel">
+        <div class="filter-bar">
+          <button type="button" class="chip active" data-filter="all">全部</button>
+          <button type="button" class="chip" data-filter="slow">慢步骤 ≥15s</button>
+          <button type="button" class="chip" data-filter="error">异常</button>
+        </div>
+        <div id="timeline-list" class="timeline-list"></div>
+        <p id="timeline-empty" class="empty-block hidden">暂无匹配的执行轨迹记录</p>
+      </section>
+    </main>
+
+    <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

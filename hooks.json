@@ -1,0 +1,38 @@
+{
+  "antigravity-session-monitor-telemetry": {
+    "enabled": true,
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "./scripts/run_hook.sh SessionStart",
+        "timeout": 5
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "./scripts/run_hook.sh PreInvocation",
+        "timeout": 5
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/run_hook.sh PostToolUse",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "./scripts/run_hook.sh Stop",
+        "timeout": 5
+      }
+    ]
+  }
+}

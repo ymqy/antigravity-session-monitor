@@ -1,0 +1,18 @@
+{
+  "name": "antigravity-session-monitor",
+  "displayName": "Antigravity 会话监控",
+  "version": "1.0.0",
+  "description": "实时监控 Antigravity 会话运行状态、Token 生成速度（t/s）、上下文水位与一键压缩、阶段里程碑进度、并发子代理与疑似卡死诊断。",
+  "logo": "assets/logo.svg",
+  "homepage": "https://github.com/ymqy/antigravity-session-monitor",
+  "repository": "https://github.com/ymqy/antigravity-session-monitor",
+  "suggestedPrompts": [
+    "打开当前会话的实时监控面板",
+    "帮我诊断当前会话或子代理为什么看起来像卡住了",
+    "将这个复杂任务拆解为阶段清单并实时监控执行进度"
+  ],
+  "author": {
+    "name": "ymqy",
+    "url": "https://github.com/ymqy"
+  }
+}
