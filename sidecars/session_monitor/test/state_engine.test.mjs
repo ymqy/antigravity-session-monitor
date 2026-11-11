@@ -451,7 +451,7 @@ test('parseTranscript & evaluateConversationHealth detect user message Revert (æ
       tool_calls: [
         {
           name: 'run_command',
-          args: { CommandLine: '"ls -la /Users/anon/dev/demo/agy-plugin/antigravity-session-monitor"' },
+          args: { CommandLine: '"ls -la /Users/anon/dev/my/antigravity-session-monitor"' },
         },
       ],
     }),
