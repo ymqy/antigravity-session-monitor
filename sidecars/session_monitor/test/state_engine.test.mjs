@@ -636,3 +636,112 @@ test('SQLite CORTEX_STEP_STATUS_WAITING (9), RUNNING (2), and CANCELED (6) drive
   assert.equal(hCancel.badge, '已手动停止');
 });
 
+test('evaluateConversationHealth detects manual cancel during model thinking before reply arrives (no Stop hook, stale lastModifiedMs)', () => {
+  const tSend = Date.parse('2026-11-11T17:00:12.460Z');
+  // PreInvocation hook fires ~80ms AFTER SQLite writes USER_INPUT (`lastModifiedMs < invocationStartedAt`)
+  const tPreInv = tSend + 80;
+
+  // Case A: User sends prompt and clicks Stop before ANY model reply arrives
+  const linesRound1 = JSON.stringify({
+    step_index: 20,
+    source: 'USER_EXPLICIT',
+    type: 'USER_INPUT',
+    status: 'DONE',
+    created_at: '2026-11-11T17:00:12Z',
+    content: '<USER_REQUEST>\n看下行吗\n</USER_REQUEST>',
+  });
+  const hookRound1 = {
+    phase: 'thinking',
+    stop: null,
+    turnStartedAt: tPreInv,
+    invocationStartedAt: tPreInv,
+    invocationNum: 0,
+    initialNumSteps: 21,
+  };
+  const rtIdleNoNewStep = {
+    liveStepCount: 21,
+    cascadeStatus: 'CASCADE_RUN_STATUS_IDLE',
+    notFullyIdle: false,
+    hasRunningStep: false,
+    hasWaitingStep: false,
+    hasCanceledTailStep: false,
+    lastModifiedMs: tSend,
+  };
+
+  const tr1 = parseTranscript(linesRound1, tSend, hookRound1, rtIdleNoNewStep);
+  // Within 800ms startup grace window, stays THINKING to prevent early WAL flush flicker
+  const hStartup = evaluateConversationHealth({
+    now: tPreInv + 300,
+    hookState: hookRound1,
+    transcript: tr1,
+    runtimeMeta: rtIdleNoNewStep,
+  });
+  assert.equal(hStartup.state, 'THINKING');
+
+  // Once canceled (>800ms), immediately transitions to IDLE ('已手动停止') instead of staying stuck in 模型思考中
+  const hCanceledPreReply = evaluateConversationHealth({
+    now: tPreInv + 5_000,
+    hookState: hookRound1,
+    transcript: tr1,
+    runtimeMeta: rtIdleNoNewStep,
+  });
+  assert.equal(hCanceledPreReply.state, 'IDLE');
+  assert.equal(hCanceledPreReply.badge, '已手动停止');
+  assert.match(hCanceledPreReply.headline, /手动终止/);
+
+  // Case B: Multi-round task finishes tool at step 19, enters Round 7 thinking, user cancels before Round 7 PLANNER_RESPONSE
+  const tToolDone = Date.parse('2026-11-11T16:59:45.004Z');
+  const tRound7PreInv = tToolDone + 61;
+  const linesRound7 = [
+    JSON.stringify({
+      step_index: 0,
+      type: 'USER_INPUT',
+      created_at: '2026-11-11T16:57:53Z',
+      content: '<USER_REQUEST>\nPlease Review This\n</USER_REQUEST>',
+    }),
+    JSON.stringify({
+      step_index: 18,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-11T16:59:33Z',
+      input_tokens: 58000,
+      output_tokens: 220,
+      tool_calls: [{ name: 'run_command', args: { CommandLine: '"ps aux"' } }],
+    }),
+    JSON.stringify({
+      step_index: 19,
+      type: 'GENERIC',
+      status: 'DONE',
+      created_at: '2026-11-11T16:59:42Z',
+      content: 'Created At: 2026-11-12T00:59:42+08:00\nCompleted At: 2026-11-12T00:59:45+08:00\nok',
+    }),
+  ].join('\n');
+  const hookRound7 = {
+    phase: 'thinking',
+    stop: null,
+    turnStartedAt: Date.parse('2026-11-11T16:57:53.320Z'),
+    invocationStartedAt: tRound7PreInv,
+    invocationNum: 7,
+    initialNumSteps: 20,
+  };
+  const rtRound7Canceled = {
+    liveStepCount: 20,
+    cascadeStatus: 'CASCADE_RUN_STATUS_IDLE',
+    notFullyIdle: false,
+    hasRunningStep: false,
+    hasWaitingStep: false,
+    hasCanceledTailStep: false,
+    lastModifiedMs: tToolDone,
+  };
+
+  const tr7 = parseTranscript(linesRound7, tToolDone, hookRound7, rtRound7Canceled);
+  const hCanceledRound7 = evaluateConversationHealth({
+    now: tRound7PreInv + 25_000,
+    hookState: hookRound7,
+    transcript: tr7,
+    runtimeMeta: rtRound7Canceled,
+  });
+  assert.equal(hCanceledRound7.state, 'IDLE');
+  assert.equal(hCanceledRound7.badge, '已手动停止');
+  assert.match(hCanceledRound7.headline, /思考已手动终止/);
+});
+

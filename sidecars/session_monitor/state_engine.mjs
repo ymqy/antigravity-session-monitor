@@ -759,6 +759,20 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null, r
             };
           }
         }
+        if (
+          rt
+          && (rt.killed || rt.cascadeStatus === 'CASCADE_RUN_STATUS_IDLE')
+          && !rt.notFullyIdle
+          && !rt.hasRunningStep
+          && !rt.hasWaitingStep
+        ) {
+          return {
+            ...dc,
+            status: 'CANCELED',
+            durationMs: null,
+            error: '该操作已随任务终止而取消',
+          };
+        }
         return {
           ...dc,
           status: 'PENDING',
@@ -1100,31 +1114,54 @@ export function evaluateConversationHealth({
   const hookStopped = hook?.phase === 'stopped' && hook?.stop?.stoppedAt
     && (!tr.turnStartedAtMs || hook.stop.stoppedAt >= tr.turnStartedAtMs - 1000);
 
-  // 宿主级空闲/取消兜底：当用户在权限弹窗点击拒绝/停止而未触发 Stop 钩子时，SQLite 状态已转为 IDLE 且无活跃步骤
+  // 宿主级空闲/取消兜底：
+  // 实测用户在模型思考途中（尚未返回 PLANNER_RESPONSE）或权限弹窗中点击停止时：
+  // 1) 宿主不会触发 Stop 钩子；
+  // 2) 思考阶段取消不会写入新步骤，因此 `lastModifiedMs` 仍停留在上一条步骤落盘时刻（比 PreInvocation 早 60~90ms）；
+  // 3) 但 `conversation_summaries.status` 会立即切回 `CASCADE_RUN_STATUS_IDLE` 且 `not_fully_idle = 0`。
   const latestTurnStartMs = Math.max(
     hook?.invocationStartedAt || 0,
     hook?.turnStartedAt || 0,
     tr.turnStartedAtMs || 0,
   );
+  const startupSettled = !latestTurnStartMs || (now - latestTurnStartMs >= 800);
   const runtimeStoppedAfterTurnStart = Boolean(
     !hookStopped
     && rt
-    && rt.cascadeStatus === 'CASCADE_RUN_STATUS_IDLE'
+    && (rt.killed || rt.cascadeStatus === 'CASCADE_RUN_STATUS_IDLE')
     && !rt.notFullyIdle
     && !rt.hasRunningStep
     && !rt.hasWaitingStep
     && (
-      rt.hasCanceledTailStep
+      rt.killed
+      || rt.hasCanceledTailStep
       || (rt.lastModifiedMs && latestTurnStartMs > 0 && rt.lastModifiedMs >= latestTurnStartMs + 150)
+      || startupSettled
     ),
   );
 
   if (runtimeStoppedAfterTurnStart && activeSubagents.length === 0 && runningBgTasks.length === 0) {
-    const stopTs = rt.lastModifiedMs || now;
+    const stopTs = Math.max(rt.lastModifiedMs || 0, tr.lastStepAtMs || 0, latestTurnStartMs || 0) || now;
     const totalTurnSec = turnStart && stopTs >= turnStart
       ? Math.max(0, Math.round((stopTs - turnStart) / 1000))
       : 0;
     if (tr.turnIdleByTranscript && !rt.hasCanceledTailStep) {
+      if (tr.lastPlannerRequestFeedback && (now - stopTs <= STALE_FEEDBACK_MS)) {
+        return {
+          state: 'WAITING_USER',
+          badge: '等待审阅方案',
+          severity: 'action_required',
+          headline: '文档或方案已就绪，等待你点击继续或提出修改意见',
+          detail: '智能体已暂停执行，正在等待你审阅确认最新生成的方案文档',
+          elapsedSec: Math.max(0, Math.round((now - stopTs) / 1000)),
+          startedAtMs: stopTs,
+          turnStartedAtMs: turnStart,
+          modelName,
+          invocationNum,
+          process: null,
+          alertKey: `waiting-artifact-${tr.stepCount}`,
+        };
+      }
       const lastToolRoundInTurn = [...tr.rounds]
         .reverse()
         .find((r) => r.kind === 'planner' && r.inCurrentTurn && r.tools?.length > 0);
@@ -1146,11 +1183,14 @@ export function evaluateConversationHealth({
         alertKey: null,
       };
     }
+    const cancelHeadline = survivingTurnRounds === 0
+      ? '已在收到模型回复前手动终止，等待新指令'
+      : (!rt.hasCanceledTailStep ? '本轮思考已手动终止，等待新指令' : '任务已手动取消');
     return {
       state: 'IDLE',
       badge: '已手动停止',
       severity: 'idle',
-      headline: '任务已手动取消',
+      headline: cancelHeadline,
       detail: '',
       elapsedSec: 0,
       startedAtMs: stopTs,
