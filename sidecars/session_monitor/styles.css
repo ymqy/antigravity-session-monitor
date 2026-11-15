@@ -66,8 +66,10 @@ html, body {
   display: flex;
   flex-direction: column;
   height: 100vh;
+  width: 100%;
   max-width: 680px;
   margin: 0 auto;
+  overflow-x: hidden;
 }
 
 /* ---------- 顶部极简导航栏 ---------- */
@@ -86,19 +88,24 @@ html, body {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  min-width: 0;
 }
 
 .brand-group {
   display: flex;
   align-items: center;
   gap: 7px;
+  flex: 1 1 auto;
   min-width: 0;
+  overflow: hidden;
 }
 
 .brand-name {
   font-weight: 600;
   font-size: 13.5px;
   letter-spacing: -0.01em;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .ws-tag {
@@ -108,6 +115,11 @@ html, body {
   background: rgba(142, 150, 168, 0.12);
   color: var(--tp-muted);
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  max-width: 100%;
+  flex: 0 1 auto;
 }
 
 .topbar-right {
@@ -123,6 +135,7 @@ html, body {
   padding: 2px;
   border-radius: 7px;
   background: rgba(142, 150, 168, 0.11);
+  flex-shrink: 0;
 }
 
 .seg-tab {
@@ -138,6 +151,8 @@ html, body {
   display: inline-flex;
   align-items: center;
   gap: 4px;
+  white-space: nowrap;
+  flex-shrink: 0;
   transition: color 0.15s, background 0.15s;
 }
 
@@ -165,6 +180,7 @@ html, body {
   background: transparent;
   color: var(--tp-muted);
   cursor: pointer;
+  flex-shrink: 0;
   transition: color 0.15s, background 0.15s;
 }
 
@@ -181,9 +197,12 @@ html, body {
   margin-top: 5px;
   font-size: 12px;
   color: var(--tp-muted);
+  min-width: 0;
 }
 
 .conv-title {
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -203,6 +222,7 @@ html, body {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
   margin-bottom: 8px;
 }
 
@@ -210,11 +230,12 @@ html, body {
   font-size: 12px;
   font-weight: 600;
   color: var(--tp-muted);
+  white-space: nowrap;
 }
 
 .settings-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
 }
 
@@ -224,9 +245,12 @@ html, body {
   gap: 3px;
   font-size: 11.5px;
   color: var(--tp-muted);
+  min-width: 0;
 }
 
 .field input {
+  width: 100%;
+  min-width: 0;
   padding: 5px 7px;
   border-radius: 6px;
   border: 1px solid var(--tp-border);
@@ -246,7 +270,9 @@ html, body {
 
 .viewport {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 14px;
 }
 
@@ -254,6 +280,7 @@ html, body {
   display: none;
   flex-direction: column;
   gap: 18px;
+  min-width: 0;
 }
 
 .tab-panel.active {
@@ -338,15 +365,17 @@ html, body {
 
 .hero-head {
   display: flex;
-  align-items: baseline;
+  align-items: flex-start;
   justify-content: space-between;
-  gap: 10px;
+  gap: 8px 10px;
 }
 
 .hero-state-wrap {
   display: flex;
   align-items: center;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 5px 7px;
+  flex: 1 1 auto;
   min-width: 0;
 }
 
@@ -357,6 +386,7 @@ html, body {
   letter-spacing: -0.01em;
   line-height: 1.25;
   color: var(--tp-fg);
+  white-space: nowrap;
 }
 
 .sev-healthy .hero-state-title { color: var(--hue-healthy); }
@@ -374,6 +404,8 @@ html, body {
   background: rgba(16, 185, 129, 0.12);
   color: var(--hue-healthy);
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .compact-tag {
@@ -387,6 +419,7 @@ html, body {
   color: var(--tp-fg);
   cursor: pointer;
   white-space: nowrap;
+  flex-shrink: 0;
   transition: opacity 0.15s, background 0.15s;
 }
 
@@ -412,8 +445,11 @@ html, body {
   font-size: 18px;
   font-weight: 700;
   letter-spacing: -0.02em;
+  line-height: 1.2;
   font-variant-numeric: tabular-nums;
   color: var(--tp-fg);
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .hero-action {
@@ -423,6 +459,7 @@ html, body {
   color: var(--tp-muted);
   line-height: 1.45;
   word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .sev-healthy .hero-action,
@@ -438,6 +475,7 @@ html, body {
   font-size: 12px;
   color: var(--tp-muted);
   word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 /* 三栏核心遥测条 */
@@ -446,7 +484,7 @@ html, body {
   padding-top: 11px;
   border-top: 1px solid var(--tp-border-soft);
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
 }
 
@@ -460,6 +498,7 @@ html, body {
 .metric-label {
   font-size: 11px;
   color: var(--tp-muted);
+  white-space: nowrap;
 }
 
 .metric-val {
@@ -468,6 +507,8 @@ html, body {
   color: var(--tp-fg);
   letter-spacing: -0.01em;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .metric-val.is-live-speed {
@@ -515,6 +556,7 @@ html, body {
   display: flex;
   align-items: center;
   justify-content: flex-end;
+  flex-wrap: wrap;
   gap: 6px;
   margin-top: 6px;
 }
@@ -523,6 +565,15 @@ html, body {
   margin-right: auto;
   font-size: 11.5px;
   color: var(--tp-muted);
+  min-width: 0;
+}
+
+.nudge-btn-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  margin-left: auto;
 }
 
 /* ---------- 二级 & 三级去边框无噪音分区 ---------- */
@@ -531,6 +582,7 @@ html, body {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  min-width: 0;
 }
 
 .sec-head {
@@ -538,6 +590,7 @@ html, body {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  min-width: 0;
 }
 
 .sec-head.clickable {
@@ -549,6 +602,8 @@ html, body {
   display: flex;
   align-items: center;
   gap: 6px;
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 .sec-title {
@@ -556,17 +611,23 @@ html, body {
   font-weight: 600;
   color: var(--tp-muted);
   letter-spacing: 0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .sec-meta {
   font-size: 12px;
   color: var(--tp-dim);
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .sec-right {
   display: flex;
   align-items: center;
   gap: 10px;
+  flex-shrink: 0;
 }
 
 .ms-done-icon {
@@ -609,6 +670,14 @@ html, body {
   gap: 7px;
   font-size: 12px;
   line-height: 1.42;
+  min-width: 0;
+}
+
+.ms-item > span:last-child {
+  flex: 1 1 auto;
+  min-width: 0;
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .ms-item.done {
@@ -685,6 +754,8 @@ html, body {
   font-size: 12.5px;
   font-weight: 500;
   color: var(--tp-fg);
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -693,7 +764,15 @@ html, body {
 .flat-row-ws {
   font-size: 11px;
   color: var(--tp-muted);
-  flex-shrink: 0;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: rgba(142, 150, 168, 0.1);
+  max-width: 42%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 0 1 auto;
+  min-width: 0;
 }
 
 .flat-row-right {
@@ -753,12 +832,14 @@ html, body {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
   padding: 6px 0;
   border: none;
   background: none;
   color: var(--tp-dim);
   font-family: inherit;
   font-size: 12px;
+  text-align: left;
   cursor: pointer;
 }
 
@@ -770,6 +851,7 @@ html, body {
 
 .filter-bar {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
 }
 
@@ -780,6 +862,7 @@ html, body {
   background: transparent;
   color: var(--tp-muted);
   font-size: 12px;
+  white-space: nowrap;
   cursor: pointer;
 }
 
@@ -820,9 +903,14 @@ html, body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 2px 8px;
   font-size: 11.5px;
   color: var(--tp-muted);
+}
+
+.tl-head > span:first-child {
+  white-space: nowrap;
 }
 
 .tl-title {
@@ -830,6 +918,8 @@ html, body {
   font-size: 12.5px;
   font-weight: 500;
   color: var(--tp-fg);
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .tl-tools {
@@ -846,9 +936,12 @@ html, body {
   font-size: 11.5px;
   color: var(--tp-muted);
   padding: 2px 0;
+  min-width: 0;
 }
 
 .tl-tool-label {
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -873,6 +966,7 @@ html, body {
   color: var(--hue-danger);
   font-size: 12px;
   word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 /* ---------- 通用按钮与提示 ---------- */
@@ -881,6 +975,8 @@ html, body {
   font-family: inherit;
   font-size: 12px;
   cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .ghost-btn {
@@ -939,6 +1035,9 @@ html, body {
   left: 50%;
   bottom: 18px;
   transform: translateX(-50%);
+  width: max-content;
+  max-width: calc(100vw - 24px);
+  text-align: center;
   padding: 6px 13px;
   border-radius: 999px;
   background: var(--tp-fg);
@@ -947,4 +1046,91 @@ html, body {
   font-weight: 600;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.28);
   z-index: 50;
+}
+
+/* ---------- 窄边栏响应式适配 ---------- */
+
+@media (max-width: 360px) {
+  .topbar {
+    padding: 9px 12px 8px;
+  }
+
+  .viewport {
+    padding: 12px;
+  }
+
+  .topbar-right {
+    gap: 3px;
+  }
+
+  .seg-tab {
+    padding: 3px 7px;
+  }
+
+  .icon-btn {
+    width: 24px;
+    height: 24px;
+  }
+
+  .settings-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 330px) {
+  .topbar-row:has(#ws-tag:not(.hidden)) {
+    flex-wrap: wrap;
+    row-gap: 6px;
+  }
+
+  .topbar-row:has(#ws-tag:not(.hidden)) .brand-group {
+    flex: 1 1 100%;
+  }
+
+  .topbar-row:has(#ws-tag:not(.hidden)) .topbar-right {
+    width: 100%;
+  }
+
+  .topbar-row:has(#ws-tag:not(.hidden)) .seg-tabs {
+    margin-right: auto;
+  }
+
+  .hero-card {
+    padding: 12px 12px 11px;
+  }
+
+  .hero-state-title {
+    font-size: 15.5px;
+  }
+
+  .hero-timer {
+    font-size: 16px;
+  }
+
+  .metrics-strip {
+    gap: 8px;
+  }
+
+  .metric-val {
+    font-size: 14px;
+  }
+}
+
+@media (max-width: 265px) {
+  .topbar-row {
+    flex-wrap: wrap;
+    row-gap: 6px;
+  }
+
+  .brand-group {
+    flex: 1 1 100%;
+  }
+
+  .topbar-right {
+    width: 100%;
+  }
+
+  .seg-tabs {
+    margin-right: auto;
+  }
 }

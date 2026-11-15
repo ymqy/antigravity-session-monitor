@@ -217,8 +217,11 @@
     const effectiveWsName = cur.workspaceName || (!showingOther ? state.hostWorkspaceName : '');
     if (effectiveWsName) {
       $('ws-tag').textContent = effectiveWsName;
+      $('ws-tag').title = effectiveWsName;
       $('ws-tag').classList.remove('hidden');
     } else {
+      $('ws-tag').textContent = '';
+      $('ws-tag').title = '';
       $('ws-tag').classList.add('hidden');
     }
 
@@ -466,7 +469,7 @@
           <div class="flat-row-top">
             <div class="flat-row-left">
               <span class="pulse-dot sm st-healthy"></span>
-              <span class="flat-row-title">${esc(b.description)}</span>
+              <span class="flat-row-title" title="${esc(b.description)}">${esc(b.description)}</span>
             </div>
             <div class="flat-row-right">
               <span class="row-tps idle">后台命令</span>
@@ -517,7 +520,7 @@
         <div class="flat-row-top">
           <div class="flat-row-left">
             <span class="pulse-dot sm ${sDot}"></span>
-            ${s.workspaceName ? `<span class="flat-row-ws">${esc(s.workspaceName)}</span>` : ''}
+            ${s.workspaceName ? `<span class="flat-row-ws" title="${esc(s.workspaceName)}">${esc(s.workspaceName)}</span>` : ''}
             <span class="flat-row-title" title="${esc(s.title)}">${esc(s.title)}</span>
           </div>
           <div class="flat-row-right">
