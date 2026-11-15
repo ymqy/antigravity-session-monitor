@@ -865,3 +865,220 @@ test('parseTranscript & evaluateConversationHealth track /compact pending state 
   assert.match(hDone.headline, /已完成上下文压缩/);
 });
 
+test('stale lastTool.stepIdx from before a Revert never poisons a subsequent new turn into 已撤回', () => {
+  const tOldTool = Date.parse('2026-11-12T10:00:30Z');
+  const tNewTurn = Date.parse('2026-11-12T10:05:00Z');
+
+  // Previously conversation reached step 50, then user reverted back to step 10 and started a fresh turn at step 10..11
+  const lines = [
+    JSON.stringify({
+      step_index: 0,
+      type: 'USER_INPUT',
+      created_at: '2026-11-12T09:50:00Z',
+      content: '<USER_REQUEST>初始化</USER_REQUEST>',
+    }),
+    JSON.stringify({
+      step_index: 10,
+      type: 'USER_INPUT',
+      created_at: '2026-11-12T10:05:00Z',
+      content: '<USER_REQUEST>重新实现状态同步</USER_REQUEST>',
+    }),
+  ].join('\n');
+
+  const hookWithStaleLastTool = {
+    phase: 'thinking',
+    turnStartedAt: tNewTurn,
+    invocationStartedAt: tNewTurn + 50,
+    invocationNum: 0,
+    initialNumSteps: 11,
+    // Even if an old hook file still carried lastTool from step 48 of the reverted branch:
+    lastTool: { toolName: 'run_command', stepIdx: 48, finishedAt: tOldTool, error: null },
+    stop: null,
+  };
+  const rtNewTurn = {
+    liveStepCount: 11,
+    cascadeStatus: 'CASCADE_RUN_STATUS_RUNNING',
+    notFullyIdle: true,
+    lastModifiedMs: tNewTurn,
+  };
+
+  const tr = parseTranscript(lines, tNewTurn, hookWithStaleLastTool, rtNewTurn);
+  const h = evaluateConversationHealth({
+    now: tNewTurn + 3_000,
+    hookState: hookWithStaleLastTool,
+    transcript: tr,
+    runtimeMeta: rtNewTurn,
+  });
+  assert.equal(h.state, 'THINKING');
+  assert.notEqual(h.badge, '已撤回');
+  assert.equal(h.invocationNum, 1);
+});
+
+test('canceling Turn 2 before Turn 2 writes any step reports 已手动停止 (never Turn 1 COMPLETED) even with stale hasRunningStep', () => {
+  const tTurn1Done = Date.parse('2026-11-12T11:00:10Z');
+  const tTurn2Start = Date.parse('2026-11-12T11:02:00Z');
+
+  // Transcript still ends at Turn 1's completed PLANNER_RESPONSE because Turn 2 was aborted before writing
+  const lines = [
+    JSON.stringify({
+      step_index: 0,
+      type: 'USER_INPUT',
+      created_at: '2026-11-12T11:00:00Z',
+      content: '<USER_REQUEST>第一轮任务</USER_REQUEST>',
+    }),
+    JSON.stringify({
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-12T11:00:10Z',
+      input_tokens: 4000,
+      output_tokens: 180,
+      content: '第一轮已完成',
+      tool_calls: [],
+    }),
+  ].join('\n');
+
+  const hookTurn2Aborted = {
+    phase: 'thinking',
+    turnStartedAt: tTurn2Start,
+    invocationStartedAt: tTurn2Start + 40,
+    invocationNum: 0,
+    initialNumSteps: 2,
+    stop: null,
+  };
+  const rtIdleAfterAbort = {
+    liveStepCount: 2,
+    cascadeStatus: 'CASCADE_RUN_STATUS_IDLE',
+    notFullyIdle: false,
+    hasRunningStep: true, // Stale status=8/2 left in steps table when killed mid-generation
+    hasWaitingStep: false,
+    hasCanceledTailStep: false,
+    lastModifiedMs: tTurn1Done,
+  };
+
+  const tr = parseTranscript(lines, tTurn1Done, hookTurn2Aborted, rtIdleAfterAbort);
+  const h = evaluateConversationHealth({
+    now: tTurn2Start + 2_000,
+    hookState: hookTurn2Aborted,
+    transcript: tr,
+    runtimeMeta: rtIdleAfterAbort,
+  });
+  assert.equal(h.state, 'IDLE');
+  assert.equal(h.badge, '已手动停止');
+});
+
+test('Stop hook distinguishes user context cancellation from real API errors and localizes error details', () => {
+  const t0 = Date.parse('2026-11-12T12:00:00Z');
+  const lines = JSON.stringify({
+    step_index: 0,
+    type: 'USER_INPUT',
+    created_at: '2026-11-12T12:00:00Z',
+    content: '<USER_REQUEST>hi</USER_REQUEST>',
+  });
+  const tr = parseTranscript(lines, t0);
+
+  // 1) User clicked Stop -> Stop hook received terminationReason: ERROR with "context canceled"
+  const hUserCanceled = evaluateConversationHealth({
+    now: t0 + 4_000,
+    transcript: tr,
+    hookState: {
+      phase: 'stopped',
+      turnStartedAt: t0,
+      invocationNum: 0,
+      stop: {
+        terminationReason: 'ERROR',
+        error: 'rpc error: code = Canceled desc = context canceled',
+        fullyIdle: true,
+        stoppedAt: t0 + 2_500,
+      },
+    },
+  });
+  assert.equal(hUserCanceled.state, 'IDLE');
+  assert.equal(hUserCanceled.badge, '已手动停止');
+
+  // 2) Real API error (e.g., unsupported region) -> ERROR_STOPPED with localized Chinese explanation
+  const hRegionErr = evaluateConversationHealth({
+    now: t0 + 4_000,
+    transcript: tr,
+    hookState: {
+      phase: 'stopped',
+      turnStartedAt: t0,
+      invocationNum: 0,
+      stop: {
+        terminationReason: 'ERROR',
+        error: 'FAILED_PRECONDITION: User location is not supported for the API use.',
+        fullyIdle: true,
+        stoppedAt: t0 + 2_500,
+      },
+    },
+  });
+  assert.equal(hRegionErr.state, 'ERROR_STOPPED');
+  assert.equal(hRegionErr.badge, '异常中断');
+  assert.match(hRegionErr.detail, /当前网络节点所在地区不支持调用该模型接口/);
+});
+
+test('parseTranscript separates turnLatestTps from historical latestTps and scopes subagentRefs by turn', () => {
+  const t0 = Date.parse('2026-11-12T13:00:00Z');
+  const lines = [
+    JSON.stringify({
+      step_index: 0,
+      type: 'USER_INPUT',
+      created_at: '2026-11-12T13:00:00Z',
+      content: '<USER_REQUEST>Turn 1</USER_REQUEST>',
+    }),
+    JSON.stringify({
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-12T13:00:00Z',
+      input_tokens: 5000,
+      output_tokens: 500,
+      tool_calls: [{ name: 'invoke_subagent', args: { TypeName: '"scout"', Role: '"Old Scout"', Prompt: '"Check"' } }],
+    }),
+    JSON.stringify({
+      step_index: 2,
+      type: 'GENERIC',
+      status: 'DONE',
+      created_at: '2026-11-12T13:00:10Z',
+      content: 'Created At: 2026-11-12T21:00:10+08:00\nCompleted At: 2026-11-12T21:00:11+08:00\n{"conversationId":"11111111-2222-3333-4444-555555555555"}',
+    }),
+    // Turn 2 just started; no Turn 2 PLANNER_RESPONSE has landed yet
+    JSON.stringify({
+      step_index: 3,
+      type: 'USER_INPUT',
+      created_at: '2026-11-12T13:05:00Z',
+      content: '<USER_REQUEST>Turn 2</USER_REQUEST>',
+    }),
+  ].join('\n');
+
+  const tr = parseTranscript(lines, t0 + 300_000);
+  assert.equal(tr.tokenSpeed.latestTps, 50.0);
+  assert.equal(tr.tokenSpeed.turnLatestTps, null);
+  assert.equal(tr.tokenSpeed.turnAvgTps, null);
+  assert.equal(tr.subagentRefs.length, 1);
+  assert.equal(tr.subagentRefs[0].inCurrentTurn, false);
+
+  // Old errored subagent from Turn 1 must NOT poison Turn 2 into STUCK_SUSPECTED
+  const hTurn2 = evaluateConversationHealth({
+    now: t0 + 302_000,
+    hookState: {
+      phase: 'thinking',
+      turnStartedAt: t0 + 300_000,
+      invocationStartedAt: t0 + 300_050,
+      invocationNum: 0,
+    },
+    transcript: tr,
+    subagents: [
+      {
+        conversationId: '11111111-2222-3333-4444-555555555555',
+        role: 'Old Scout',
+        state: 'ERROR_STOPPED',
+        badge: '异常中断',
+        headline: '旧轮次子代理报错',
+        isRunning: false,
+        inCurrentTurn: false,
+      },
+    ],
+  });
+  assert.equal(hTurn2.state, 'THINKING');
+});
+
+

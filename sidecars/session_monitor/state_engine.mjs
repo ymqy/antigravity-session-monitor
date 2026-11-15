@@ -159,10 +159,13 @@ export function localizeModelName(raw) {
 }
 
 export function localizeErrorText(raw) {
-  const s = oneLine(raw || '', 220);
+  const s = oneLine(String(raw || '').replace(/^generating and executing:\s*/i, ''), 220);
   if (!s) return '发生未知运行异常';
   if (/stream was interrupted/i.test(s)) {
     return '模型输出流意外中断，请点击「发消息追问/唤醒」继续执行刚才的任务';
+  }
+  if (/User location is not supported/i.test(s)) {
+    return '当前网络节点所在地区不支持调用该模型接口，请检查代理或切换网络';
   }
   if (/connection reset by peer/i.test(s)) {
     return '网络连接被远端重置，系统正在自动重连重试';
@@ -172,6 +175,12 @@ export function localizeErrorText(raw) {
   }
   if (/\b429\b|rate.?limit/i.test(s)) {
     return '触发接口速率限制，系统正在退避重试';
+  }
+  if (/PERMISSION_DENIED|UNAUTHENTICATED|\b40[13]\b/i.test(s)) {
+    return '账号认证失效或无当前模型调用权限';
+  }
+  if (/UNAVAILABLE|service unavailable|bad gateway|\b50[234]\b/i.test(s)) {
+    return '远端模型服务暂时不可用，请稍后重试';
   }
   if (/deadline exceeded|timed? out/i.test(s)) {
     return '模型接口请求超时';
@@ -476,6 +485,7 @@ export function matchActiveProcess(psRows, { commandLine = '', workspacePaths = 
 
 const EMPTY_TOKEN_SPEED = Object.freeze({
   latestTps: null,
+  turnLatestTps: null,
   latestOutTokens: 0,
   latestGenSec: null,
   turnAvgTps: null,
@@ -512,6 +522,7 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null, r
     pendingStartedAtMs: null,
     lastPlannerRequestFeedback: false,
     lastPlannerHasNoTools: false,
+    lastStepCanceled: false,
     latestErrorStep: null,
     turnIdleByTranscript: true,
   };
@@ -600,6 +611,23 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null, r
   const subagentMap = new Map();
   const bgTaskMap = new Map();
 
+  let finalUserStepIdx = -1;
+  for (let i = steps.length - 1; i >= 0; i--) {
+    if (steps[i].type === 'USER_INPUT') {
+      finalUserStepIdx = i;
+      break;
+    }
+  }
+  const finalUserCreatedMs = finalUserStepIdx >= 0 ? parseIsoMs(steps[finalUserStepIdx].created_at) : 0;
+  const tailStepCreatedMs = parseIsoMs(lastStepObj.created_at) || transcriptMtimeMs || 0;
+  const hookAheadOfTranscriptTurn = Boolean(
+    hookState?.turnStartedAt
+    && tailStepCreatedMs > 0
+    && hookState.turnStartedAt > tailStepCreatedMs + 500
+    && (!finalUserCreatedMs || hookState.turnStartedAt > finalUserCreatedMs + 2000),
+  );
+  const currentTurnAfterIdx = hookAheadOfTranscriptTurn ? steps.length : finalUserStepIdx;
+
   let prevTimestampMs = null;
 
   for (let i = 0; i < steps.length; i++) {
@@ -624,7 +652,7 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null, r
         totalMs: 0,
         title: `已完成上下文压缩（第 ${compactCount} 次）`,
         tools: [],
-        inCurrentTurn: i > lastUserStepIdx,
+        inCurrentTurn: i > currentTurnAfterIdx,
       });
       continue;
     }
@@ -663,7 +691,7 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null, r
         title: '接口或流式传输中断',
         error: errText,
         tools: [],
-        inCurrentTurn: i > lastUserStepIdx,
+        inCurrentTurn: i > currentTurnAfterIdx,
       });
       continue;
     }
@@ -707,19 +735,12 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null, r
           };
         }
         // 对齐宿主 `conversations/<id>.db` 的实时步骤状态（9=WAITING 待确认，2=RUNNING 已放行，6/5=CANCELED 已拒绝/取消）
+        const cascadeStopped = Boolean(
+          rt && (rt.killed || (rt.cascadeStatus === 'CASCADE_RUN_STATUS_IDLE' && !rt.notFullyIdle)),
+        );
         const expectedToolIdx = Number.isFinite(st.step_index) ? st.step_index + 1 + idx : null;
         const dbStep = expectedToolIdx != null ? rt?.stepStatusByIndex?.[expectedToolIdx] : null;
         if (dbStep && dbStep.stepType !== 15) {
-          if (dbStep.status === 9) {
-            return {
-              ...dc,
-              status: 'WAITING',
-              waitingApproval: true,
-              confirmedRunning: false,
-              durationMs: null,
-              error: '',
-            };
-          }
           if (dbStep.status === 5 || dbStep.status === 6) {
             return {
               ...dc,
@@ -752,7 +773,17 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null, r
               error: '',
             };
           }
-          if (dbStep.status === 2 || dbStep.status === 1 || dbStep.status === 11) {
+          if (!cascadeStopped && dbStep.status === 9) {
+            return {
+              ...dc,
+              status: 'WAITING',
+              waitingApproval: true,
+              confirmedRunning: false,
+              durationMs: null,
+              error: '',
+            };
+          }
+          if (!cascadeStopped && (dbStep.status === 2 || dbStep.status === 1 || dbStep.status === 11)) {
             return {
               ...dc,
               status: 'PENDING',
@@ -763,13 +794,7 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null, r
             };
           }
         }
-        if (
-          rt
-          && (rt.killed || rt.cascadeStatus === 'CASCADE_RUN_STATUS_IDLE')
-          && !rt.notFullyIdle
-          && !rt.hasRunningStep
-          && !rt.hasWaitingStep
-        ) {
+        if (cascadeStopped && !rt.hasWaitingStep) {
           return {
             ...dc,
             status: 'CANCELED',
@@ -803,7 +828,13 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null, r
             model: dc.model || '',
             stepIndex: st.step_index ?? i,
             startedAtMs: tStart,
+            inCurrentTurn: i > currentTurnAfterIdx,
           });
+        }
+      } else if (dc.name === 'send_message' && i > currentTurnAfterIdx) {
+        const recipientId = unquote(rawCalls[idx]?.args?.Recipient || '');
+        if (recipientId && subagentMap.has(recipientId)) {
+          subagentMap.get(recipientId).inCurrentTurn = true;
         }
       }
 
@@ -913,7 +944,7 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null, r
       tools: toolEntries,
       tokens: { in: inTok, cache: cacheTok, out: outTok },
       hasError: toolEntries.some((t) => t.status === 'ERROR'),
-      inCurrentTurn: i > lastUserStepIdx,
+      inCurrentTurn: i > currentTurnAfterIdx,
     });
   }
 
@@ -941,7 +972,9 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null, r
   }
 
   const lastPlannerRequestFeedback = Boolean(
-    lastPlannerRound && lastPlannerRound.tools.some((t) => t.requestFeedback && t.name !== 'ask_question'),
+    lastPlannerRound
+    && lastPlannerRound.inCurrentTurn
+    && lastPlannerRound.tools.some((t) => t.requestFeedback && t.name !== 'ask_question'),
   );
   const lastPlannerHasNoTools = Boolean(
     lastPlannerRound && lastPlannerRound.tools.length === 0 && lastStepObj.type === 'PLANNER_RESPONSE',
@@ -950,12 +983,22 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null, r
   const isManualCompactTurn = lastUserStepIdx >= 0 && /^\/compact(?:\s|$)/i.test(lastUserPrompt);
   const isCompactPending = isManualCompactTurn && lastCompactIdx < lastUserStepIdx;
 
+  const lastStepStatusUpper = String(lastStepObj.status || 'DONE').toUpperCase();
+  const lastStepCanceled = lastStepStatusUpper === 'CANCELED'
+    || lastStepStatusUpper === 'INTERRUPTED'
+    || Boolean(rt?.hasCanceledTailStep);
+
   let turnIdleByTranscript = false;
-  if (lastStepObj.type === 'PLANNER_RESPONSE' && (!Array.isArray(lastStepObj.tool_calls) || lastStepObj.tool_calls.length === 0)) {
+  if (
+    !lastStepCanceled
+    && lastStepStatusUpper !== 'ERROR'
+    && lastStepObj.type === 'PLANNER_RESPONSE'
+    && (!Array.isArray(lastStepObj.tool_calls) || lastStepObj.tool_calls.length === 0)
+  ) {
     turnIdleByTranscript = true;
-  } else if (isManualCompactTurn && lastStepObj.type === 'CHECKPOINT') {
+  } else if (!lastStepCanceled && isManualCompactTurn && lastStepObj.type === 'CHECKPOINT') {
     turnIdleByTranscript = true;
-  } else if (lastPlannerRound && pendingTools.length === 0) {
+  } else if (!lastStepCanceled && lastPlannerRound && pendingTools.length === 0) {
     const hasSwarmWaitDone = lastPlannerRound.tools.some((t) => t.name === 'swarm_wait' && t.status === 'DONE');
     if (hasSwarmWaitDone || lastPlannerRequestFeedback) {
       turnIdleByTranscript = true;
@@ -971,6 +1014,7 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null, r
   let tokenSpeed = { ...EMPTY_TOKEN_SPEED };
   if (measuredPlannerRounds.length > 0) {
     const lastMeasured = measuredPlannerRounds[measuredPlannerRounds.length - 1];
+    let lastTurnMeasured = null;
     let allOut = 0;
     let allGenMs = 0;
     let turnOut = 0;
@@ -982,6 +1026,7 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null, r
       if (mr.inCurrentTurn) {
         turnOut += mr.tokens.out;
         turnGenMs += mr.genMs;
+        lastTurnMeasured = mr;
       }
       if (mr.tps > peak) peak = mr.tps;
     }
@@ -989,6 +1034,7 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null, r
     const turnAvgTps = turnGenMs > 0 ? Math.round((turnOut / (turnGenMs / 1000)) * 10) / 10 : null;
     tokenSpeed = {
       latestTps: lastMeasured.tps,
+      turnLatestTps: lastTurnMeasured ? lastTurnMeasured.tps : null,
       latestOutTokens: lastMeasured.tokens.out,
       latestGenSec: Math.round((lastMeasured.genMs / 1000) * 10) / 10,
       turnAvgTps,
@@ -1033,12 +1079,14 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null, r
     pendingStartedAtMs,
     lastPlannerRequestFeedback,
     lastPlannerHasNoTools,
+    lastStepCanceled,
     latestErrorStep,
     turnIdleByTranscript,
   };
 }
 
 const QUOTA_RE = /RESOURCE_EXHAUSTED|quota|\b429\b|exhausted your capacity|rate.?limit/i;
+const USER_ABORT_ERR_RE = /\bcontext cancel(?:ed|led)\b|\boperation was cancel(?:ed|led)\b|\baborted by user\b|\buser cancel(?:ed|led)\b|\brequest cancel(?:ed|led)\b/i;
 const STALE_UNHOOKED_MS = 20 * 60 * 1000;
 const STALE_FEEDBACK_MS = 30 * 60 * 1000;
 
@@ -1065,9 +1113,11 @@ export function evaluateConversationHealth({
   // 0. 优先检测用户「撤回（Undo/Revert）」动作：
   // 点击撤回时宿主不会触发 Stop 钩子，也不会截断只追加的 transcript.jsonl，但会立即从 SQLite 删除回退步骤
   const liveStepCount = Number.isFinite(rt?.liveStepCount) && rt.liveStepCount >= 0 ? rt.liveStepCount : null;
+  const lastToolInCurrentTurn = Number.isFinite(hook?.lastTool?.stepIdx)
+    && (!hook?.turnStartedAt || !hook?.lastTool?.finishedAt || hook.lastTool.finishedAt >= hook.turnStartedAt - 500);
   const hookWatermarkSteps = Math.max(
     Number.isFinite(hook?.initialNumSteps) ? hook.initialNumSteps : 0,
-    Number.isFinite(hook?.lastTool?.stepIdx) ? hook.lastTool.stepIdx + 1 : 0,
+    lastToolInCurrentTurn ? hook.lastTool.stepIdx + 1 : 0,
   );
   const revertedByHookWatermark = liveStepCount != null
     && hook?.phase !== 'stopped'
@@ -1092,7 +1142,10 @@ export function evaluateConversationHealth({
     };
   }
 
-  const invocationNum = hook?.invocationNum || survivingTurnRounds || 0;
+  const rawHookInv = Number.isFinite(hook?.invocationNum) ? hook.invocationNum : null;
+  const invocationNum = hook?.phase !== 'stopped' && rawHookInv != null
+    ? Math.max(survivingTurnRounds, rawHookInv + 1)
+    : (survivingTurnRounds || 0);
   const turnStart = hook?.turnStartedAt || tr.turnStartedAtMs || null;
   const latestActivityMs = Math.max(hook?.updatedAt || 0, tr.lastStepAtMs || 0);
 
@@ -1108,25 +1161,41 @@ export function evaluateConversationHealth({
       turnStartedAtMs: turnStart,
       turnDurationSec: 0,
       modelName,
-      invocationNum,
+      invocationNum: survivingTurnRounds,
       process: null,
       alertKey: null,
     };
   }
 
-  const activeSubagents = subagents.filter((s) => s.isRunning);
-  const erroredSubagent = subagents.find((s) => s.state === 'ERROR_STOPPED' || s.state === 'STUCK_SUSPECTED');
+  const cascadeIdle = Boolean(
+    (hook?.phase === 'stopped' && hook?.stop?.fullyIdle)
+    || (rt && (rt.killed || (rt.cascadeStatus === 'CASCADE_RUN_STATUS_IDLE' && !rt.notFullyIdle))),
+  );
+  const activeSubagents = rt?.killed ? [] : subagents.filter((s) => s.isRunning);
+  const erroredSubagent = subagents.find(
+    (s) => s.state === 'STUCK_SUSPECTED' || (s.state === 'ERROR_STOPPED' && s.inCurrentTurn !== false),
+  );
 
-  const runningBgTasks = (hook?.phase === 'stopped' && hook?.stop?.fullyIdle)
+  const runningBgTasks = cascadeIdle
     ? []
     : tr.bgTasks.filter((b) => b.status === 'running');
 
-  const hookStopped = hook?.phase === 'stopped' && hook?.stop?.stoppedAt
-    && (!tr.turnStartedAtMs || hook.stop.stoppedAt >= tr.turnStartedAtMs - 1000);
+  const sqlActivelyRunningNewTurn = Boolean(
+    rt?.cascadeStatus === 'CASCADE_RUN_STATUS_RUNNING'
+    && rt?.notFullyIdle
+    && hook?.stop?.stoppedAt
+    && now - hook.stop.stoppedAt >= 3000,
+  );
+  const hookStopped = Boolean(
+    hook?.phase === 'stopped'
+    && hook?.stop?.stoppedAt
+    && !sqlActivelyRunningNewTurn
+    && (!tr.turnStartedAtMs || hook.stop.stoppedAt >= tr.turnStartedAtMs - 1000),
+  );
 
   // 宿主级空闲/取消兜底：
-  // 实测用户在模型思考途中（尚未返回 PLANNER_RESPONSE）或权限弹窗中点击停止时：
-  // 1) 宿主不会触发 Stop 钩子；
+  // 实测用户在模型思考途中（尚未返回 PLANNER_RESPONSE）或工具运行/权限弹窗中点击停止时：
+  // 1) 宿主往往不会触发 Stop 钩子；
   // 2) 思考阶段取消不会写入新步骤，因此 `lastModifiedMs` 仍停留在上一条步骤落盘时刻（比 PreInvocation 早 60~90ms）；
   // 3) 但 `conversation_summaries.status` 会立即切回 `CASCADE_RUN_STATUS_IDLE` 且 `not_fully_idle = 0`。
   const latestTurnStartMs = Math.max(
@@ -1140,22 +1209,73 @@ export function evaluateConversationHealth({
     && rt
     && (rt.killed || rt.cascadeStatus === 'CASCADE_RUN_STATUS_IDLE')
     && !rt.notFullyIdle
-    && !rt.hasRunningStep
-    && !rt.hasWaitingStep
     && (
       rt.killed
       || rt.hasCanceledTailStep
-      || (rt.lastModifiedMs && latestTurnStartMs > 0 && rt.lastModifiedMs >= latestTurnStartMs + 150)
+      || (
+        !rt.hasRunningStep
+        && !rt.hasWaitingStep
+        && rt.lastModifiedMs
+        && latestTurnStartMs > 0
+        && rt.lastModifiedMs >= latestTurnStartMs + 150
+      )
       || startupSettled
     ),
   );
 
-  if (runtimeStoppedAfterTurnStart && activeSubagents.length === 0 && runningBgTasks.length === 0) {
+  if (runtimeStoppedAfterTurnStart) {
+    if (activeSubagents.length > 0) {
+      if (erroredSubagent) {
+        return {
+          state: 'STUCK_SUSPECTED',
+          badge: '子代理异常/卡住',
+          severity: 'warning',
+          headline: `子代理【${erroredSubagent.role}】${erroredSubagent.badge}`,
+          detail: erroredSubagent.detail || erroredSubagent.headline,
+          elapsedSec: erroredSubagent.elapsedSec || 0,
+          startedAtMs: erroredSubagent.startedAtMs || now,
+          turnStartedAtMs: turnStart,
+          modelName,
+          invocationNum: survivingTurnRounds,
+          process: null,
+          alertKey: `subagent-issue-${erroredSubagent.conversationId}-${erroredSubagent.state}`,
+        };
+      }
+      const lead = activeSubagents[0];
+      return {
+        state: 'SUBAGENT_RUNNING',
+        badge: `${activeSubagents.length} 个子代理运行中`,
+        severity: 'healthy',
+        headline: `【${lead.role}】${lead.headline}`,
+        detail: `${lead.badge} · 已执行 ${lead.stepCount} 步`,
+        elapsedSec: lead.elapsedSec || 0,
+        startedAtMs: lead.startedAtMs || now,
+        turnStartedAtMs: turnStart,
+        modelName,
+        invocationNum: survivingTurnRounds,
+        process: null,
+        alertKey: null,
+      };
+    }
+
     const stopTs = Math.max(rt.lastModifiedMs || 0, tr.lastStepAtMs || 0, latestTurnStartMs || 0) || now;
     const totalTurnSec = turnStart && stopTs >= turnStart
       ? Math.max(0, Math.round((stopTs - turnStart) / 1000))
       : 0;
-    if (tr.turnIdleByTranscript && !rt.hasCanceledTailStep) {
+    const abortedBeforeNewStep = Boolean(
+      hook
+      && hook.phase !== 'stopped'
+      && hook.invocationStartedAt
+      && (!tr.lastStepAtMs || hook.invocationStartedAt > tr.lastStepAtMs + 300),
+    );
+
+    if (
+      tr.turnIdleByTranscript
+      && !rt.killed
+      && !rt.hasCanceledTailStep
+      && !tr.lastStepCanceled
+      && !abortedBeforeNewStep
+    ) {
       if (tr.lastPlannerRequestFeedback && (now - stopTs <= STALE_FEEDBACK_MS)) {
         return {
           state: 'WAITING_USER',
@@ -1166,8 +1286,9 @@ export function evaluateConversationHealth({
           elapsedSec: Math.max(0, Math.round((now - stopTs) / 1000)),
           startedAtMs: stopTs,
           turnStartedAtMs: turnStart,
+          turnDurationSec: totalTurnSec,
           modelName,
-          invocationNum,
+          invocationNum: survivingTurnRounds,
           process: null,
           alertKey: `waiting-artifact-${tr.stepCount}`,
         };
@@ -1192,13 +1313,13 @@ export function evaluateConversationHealth({
         turnStartedAtMs: turnStart,
         turnDurationSec: totalTurnSec,
         modelName,
-        invocationNum,
+        invocationNum: survivingTurnRounds,
         process: null,
         alertKey: null,
       };
     }
-    const cancelHeadline = survivingTurnRounds === 0
-      ? '已在收到模型回复前手动终止，等待新指令'
+    const cancelHeadline = survivingTurnRounds === 0 || abortedBeforeNewStep
+      ? (survivingTurnRounds === 0 ? '已在收到模型回复前手动终止，等待新指令' : '本轮思考已手动终止，等待新指令')
       : (!rt.hasCanceledTailStep ? '本轮思考已手动终止，等待新指令' : '任务已手动取消');
     return {
       state: 'IDLE',
@@ -1211,7 +1332,7 @@ export function evaluateConversationHealth({
       turnStartedAtMs: turnStart,
       turnDurationSec: totalTurnSec,
       modelName,
-      invocationNum,
+      invocationNum: survivingTurnRounds,
       process: null,
       alertKey: null,
     };
@@ -1369,9 +1490,17 @@ export function evaluateConversationHealth({
   if (hookStopped && hook.stop) {
     const reason = hook.stop.terminationReason || 'NO_TOOL_CALL';
     const zhReason = TERMINATION_REASON_ZH[reason] || reason;
-    if (reason === 'ERROR' || reason === 'MAX_TOKEN_BUDGET_EXCEEDED' || reason === 'MAX_INVOCATIONS') {
-      const errDetail = hook.stop.error || tr.latestErrorStep?.error || zhReason;
-      const isQuota = QUOTA_RE.test(errDetail);
+    const rawStopErr = String(hook.stop.error || '');
+    const isAbortError = reason === 'ERROR' && USER_ABORT_ERR_RE.test(rawStopErr);
+    const totalTurnSec = turnStart
+      ? Math.max(0, Math.round((hook.stop.stoppedAt - turnStart) / 1000))
+      : 0;
+
+    if (!isAbortError && (reason === 'ERROR' || reason === 'MAX_TOKEN_BUDGET_EXCEEDED' || reason === 'MAX_INVOCATIONS')) {
+      const errDetail = rawStopErr
+        ? localizeErrorText(rawStopErr)
+        : (tr.latestErrorStep?.error || zhReason);
+      const isQuota = QUOTA_RE.test(rawStopErr) || QUOTA_RE.test(errDetail);
       return {
         state: 'ERROR_STOPPED',
         badge: isQuota ? '配额/限流中断' : '异常中断',
@@ -1381,7 +1510,7 @@ export function evaluateConversationHealth({
         elapsedSec: 0,
         startedAtMs: hook.stop.stoppedAt,
         turnStartedAtMs: turnStart,
-        turnDurationSec: turnStart ? Math.max(0, Math.round((hook.stop.stoppedAt - turnStart) / 1000)) : 0,
+        turnDurationSec: totalTurnSec,
         modelName,
         invocationNum,
         process: null,
@@ -1389,7 +1518,7 @@ export function evaluateConversationHealth({
       };
     }
 
-    if (tr.lastPlannerRequestFeedback && (now - hook.stop.stoppedAt <= STALE_FEEDBACK_MS)) {
+    if (!isAbortError && reason !== 'USER_CANCELED' && tr.lastPlannerRequestFeedback && (now - hook.stop.stoppedAt <= STALE_FEEDBACK_MS)) {
       return {
         state: 'WAITING_USER',
         badge: '等待审阅方案',
@@ -1399,6 +1528,7 @@ export function evaluateConversationHealth({
         elapsedSec: Math.max(0, Math.round((now - hook.stop.stoppedAt) / 1000)),
         startedAtMs: hook.stop.stoppedAt,
         turnStartedAtMs: turnStart,
+        turnDurationSec: totalTurnSec,
         modelName,
         invocationNum,
         process: null,
@@ -1406,7 +1536,7 @@ export function evaluateConversationHealth({
       };
     }
 
-    if (activeSubagents.length > 0 || runningBgTasks.length > 0) {
+    if (!isAbortError && reason !== 'USER_CANCELED' && (activeSubagents.length > 0 || runningBgTasks.length > 0)) {
       if (erroredSubagent) {
         return {
           state: 'STUCK_SUSPECTED',
@@ -1446,10 +1576,7 @@ export function evaluateConversationHealth({
       };
     }
 
-    const totalTurnSec = turnStart
-      ? Math.max(0, Math.round((hook.stop.stoppedAt - turnStart) / 1000))
-      : 0;
-    const isCanceled = reason === 'USER_CANCELED';
+    const isCanceled = reason === 'USER_CANCELED' || isAbortError;
 
     const lastRoundInTurn = tr.rounds[tr.rounds.length - 1];
     const lastToolRoundInTurn = [...tr.rounds]
@@ -1481,11 +1608,14 @@ export function evaluateConversationHealth({
   // 3. 检查模型是否处于推理思考中
   const isThinkingByHook = hook?.phase === 'thinking'
     && hook.invocationStartedAt
-    && (!tr.lastStepAtMs || hook.invocationStartedAt >= tr.lastStepAtMs - 2000 || !tr.turnIdleByTranscript);
+    && (!tr.lastStepAtMs || hook.invocationStartedAt >= tr.lastStepAtMs - 200 || !tr.turnIdleByTranscript);
   const isThinkingByTranscript = !hook && !tr.turnIdleByTranscript && tr.stepCount > 0;
+  const isThinkingByRuntime = Boolean(
+    !hookStopped && rt?.cascadeStatus === 'CASCADE_RUN_STATUS_RUNNING' && rt?.notFullyIdle,
+  );
 
-  if (isThinkingByHook || isThinkingByTranscript || (hook?.phase === 'post_tool' && !hookStopped)) {
-    const thinkStart = hook?.invocationStartedAt || hook?.lastTool?.finishedAt || tr.lastStepAtMs || now;
+  if (isThinkingByHook || isThinkingByTranscript || isThinkingByRuntime || (hook?.phase === 'post_tool' && !hookStopped)) {
+    const thinkStart = hook?.invocationStartedAt || hook?.lastTool?.finishedAt || tr.lastStepAtMs || rt?.lastModifiedMs || now;
     const elapsedSec = Math.max(0, Math.round((now - thinkStart) / 1000));
 
     if (tr.latestErrorStep && (!thinkStart || tr.latestErrorStep.atMs >= thinkStart - 5000)) {

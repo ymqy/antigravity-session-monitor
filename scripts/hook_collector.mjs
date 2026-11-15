@@ -118,14 +118,15 @@ try {
         .replace(/<\/?USER_REQUEST>/g, '')
         .trim();
       if (cleaned && cleaned !== prev.lastUserInput) {
-        const cleanTopic = cleaned.replace(/^\/[a-zA-Z0-9_-]+\s+/, '').trim();
-        if (!prev.firstUserInput && cleanTopic.length >= 4) {
+        const cleanTopic = cleaned.replace(/^\/[a-zA-Z0-9_-]+(?:\s+|$)/, '').trim();
+        if (!prev.firstUserInput && cleanTopic.length >= 1) {
           next.firstUserInput = cleanTopic.slice(0, 140);
         }
         next.lastUserInput = cleaned.slice(0, 280);
-        // New user request resets the turn timer
+        // New user request resets the turn timer and stale tool watermark
         next.turnStartedAt = now;
         next.stop = null;
+        next.lastTool = null;
       }
     }
 
@@ -136,12 +137,15 @@ try {
       next.phase = 'session_start';
       next.sessionStartedAt = prev.sessionStartedAt || now;
     } else if (eventName === 'PreInvocation') {
-      const invNum = Number.isFinite(payload.invocationNum) ? payload.invocationNum : ((prev.invocationNum || 0) + 1);
+      const invNum = Number.isFinite(payload.invocationNum)
+        ? payload.invocationNum
+        : ((Number.isFinite(prev.invocationNum) ? prev.invocationNum : -1) + 1);
       const stepRewound = Number.isFinite(payload.initialNumSteps)
         && Number.isFinite(prev.initialNumSteps)
         && payload.initialNumSteps < prev.initialNumSteps;
       if (!next.turnStartedAt || prev.phase === 'stopped' || invNum === 0 || stepRewound) {
         next.turnStartedAt = now;
+        next.lastTool = null;
       }
       next.phase = 'thinking';
       next.invocationStartedAt = now;
