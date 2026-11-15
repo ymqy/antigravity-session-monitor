@@ -16,6 +16,9 @@
 
   const state = {
     overrideConvId: '',
+    lastHostConvId: hostConvId(),
+    deletedHostConvId: '',
+    hostWorkspaceName: '',
     etag: '',
     uiBuildKey: '',
     serverClockSkewMs: 0,
@@ -38,6 +41,17 @@
     compactingSubmittedAtMs: 0,
     compactingUntilMs: 0,
   };
+
+  if (window.sidecar?.onWorkspaceChange) {
+    window.sidecar.onWorkspaceChange((uris) => {
+      const first = Array.isArray(uris) && uris[0] ? String(uris[0]) : '';
+      const name = first ? decodeURIComponent(first.replace(/\/+$/, '').split('/').pop() || '') : '';
+      if (name !== state.hostWorkspaceName) {
+        state.hostWorkspaceName = name;
+        if (state.snap) renderAll();
+      }
+    });
+  }
 
   // ---------- 自动同步宿主亮暗主题 ----------
   function syncThemeScheme() {
@@ -171,9 +185,14 @@
   }
 
   function activeTargetConvId() {
-    return state.overrideConvId || hostConvId();
+    if (state.overrideConvId) return state.overrideConvId;
+    const hId = hostConvId();
+    if (hId && hId === state.deletedHostConvId) return '';
+    return hId;
   }
 
+  const GENERATING_STATES = new Set(['THINKING', 'THINKING_DEEP']);
+  const RUNNING_STATES = new Set(['THINKING', 'THINKING_DEEP', 'TOOL_ACTIVE', 'RETRYING', 'SUBAGENT_RUNNING']);
   const LIVE_STATES = new Set(['THINKING', 'THINKING_DEEP', 'TOOL_ACTIVE', 'RETRYING', 'SUBAGENT_RUNNING', 'WAITING_USER', 'STUCK_SUSPECTED']);
   const INTERVENE_STATES = new Set(['STUCK_SUSPECTED', 'ERROR_STOPPED', 'WAITING_USER', 'RETRYING']);
 
@@ -186,18 +205,22 @@
     const h = cur.health || {};
     const gl = snap.global || { activeCount: 0, attentionCount: 0, sessions: [] };
     const isLive = LIVE_STATES.has(h.state);
+    const isGenerating = GENERATING_STATES.has(h.state);
+    const isRunning = RUNNING_STATES.has(h.state);
 
     // 1. 顶栏信息
-    if (cur.workspaceName) {
-      $('ws-tag').textContent = cur.workspaceName;
+    const ownId = hostConvId();
+    const effectiveOwnId = ownId && ownId === state.deletedHostConvId ? '' : ownId;
+    const showingOther = Boolean(state.overrideConvId && state.overrideConvId !== effectiveOwnId);
+    $('btn-back-own').classList.toggle('hidden', !showingOther);
+
+    const effectiveWsName = cur.workspaceName || (!showingOther ? state.hostWorkspaceName : '');
+    if (effectiveWsName) {
+      $('ws-tag').textContent = effectiveWsName;
       $('ws-tag').classList.remove('hidden');
     } else {
       $('ws-tag').classList.add('hidden');
     }
-
-    const ownId = hostConvId();
-    const showingOther = Boolean(state.overrideConvId && ownId && state.overrideConvId !== ownId);
-    $('btn-back-own').classList.toggle('hidden', !showingOther);
 
     $('conv-title').textContent = cur.conversationId
       ? (cur.title || `会话 ${cur.conversationId.slice(0, 8)}`)
@@ -231,28 +254,46 @@
     const tpsSubEl = $('metric-tps-sub');
     $('metric-speed-box').title = formatTpsTooltip(sp);
 
-    if (sp.latestTps != null) {
-      tpsEl.textContent = `${sp.latestTps.toFixed(1)} t/s`;
-      tpsEl.classList.toggle('is-live-speed', isLive);
-      tpsSubEl.textContent = sp.avgTps != null ? `均值 ${sp.avgTps.toFixed(1)} t/s` : `峰值 ${(sp.peakTps ?? sp.latestTps).toFixed(1)} t/s`;
-    } else if (h.state === 'THINKING' || h.state === 'THINKING_DEEP') {
+    if (isGenerating && sp.turnLatestTps == null) {
       tpsEl.textContent = '测速中…';
       tpsEl.classList.add('is-live-speed');
-      tpsSubEl.textContent = '等待首轮落盘';
+      tpsSubEl.textContent = sp.latestTps != null
+        ? `上轮 ${sp.latestTps.toFixed(1)} t/s`
+        : '等待首轮落盘';
+    } else if (sp.turnLatestTps != null || sp.latestTps != null) {
+      const displayTps = (isRunning && sp.turnLatestTps != null) ? sp.turnLatestTps : sp.latestTps;
+      tpsEl.textContent = `${displayTps.toFixed(1)} t/s`;
+      tpsEl.classList.toggle('is-live-speed', isRunning);
+      if (isRunning && sp.activeSubagentTpsSum) {
+        tpsSubEl.textContent = `子代理 ${sp.activeSubagentTpsSum.toFixed(1)} t/s`;
+      } else if (sp.avgTps != null) {
+        tpsSubEl.textContent = `均值 ${sp.avgTps.toFixed(1)} t/s`;
+      } else {
+        tpsSubEl.textContent = `峰值 ${(sp.peakTps ?? displayTps).toFixed(1)} t/s`;
+      }
+    } else if (h.state === 'SUBAGENT_RUNNING' && sp.activeSubagentTpsSum) {
+      tpsEl.textContent = `${sp.activeSubagentTpsSum.toFixed(1)} t/s`;
+      tpsEl.classList.add('is-live-speed');
+      tpsSubEl.textContent = '并发子代理合算';
     } else {
       tpsEl.textContent = '—';
       tpsEl.classList.remove('is-live-speed');
-      tpsSubEl.textContent = '暂无生成';
+      tpsSubEl.textContent = isRunning ? '执行操作中' : '暂无生成';
     }
 
-    const roundsCount = h.invocationNum || cur.totalRounds || 0;
+    const turnRoundNum = Number(h.invocationNum) || 0;
+    const totalRounds = Number(cur.totalRounds) || 0;
     const compactCount = cur.compactCount || 0;
-    $('metric-steps').textContent = roundsCount > 0
-      ? `${roundsCount} 轮 · ${cur.stepCount || 0} 步`
-      : `${cur.stepCount || 0} 步`;
+    if (turnRoundNum > 0 && totalRounds > turnRoundNum) {
+      $('metric-steps').textContent = `本轮 ${turnRoundNum}/${totalRounds} 轮 · ${cur.stepCount || 0} 步`;
+    } else if ((turnRoundNum || totalRounds) > 0) {
+      $('metric-steps').textContent = `${turnRoundNum || totalRounds} 轮 · ${cur.stepCount || 0} 步`;
+    } else {
+      $('metric-steps').textContent = `${cur.stepCount || 0} 步`;
+    }
     $('metric-steps-box').title = compactCount > 0
-      ? `累计 ${cur.stepCount || 0} 步 · 已压缩 ${compactCount} 次`
-      : `累计 ${cur.stepCount || 0} 步`;
+      ? `累计 ${totalRounds} 轮 / ${cur.stepCount || 0} 步 · 已压缩 ${compactCount} 次`
+      : `累计 ${totalRounds} 轮 / ${cur.stepCount || 0} 步`;
 
     const tok = cur.tokens || {};
     $('metric-ctx').textContent = fmtTokens(tok.currentContext || 0);
@@ -394,9 +435,15 @@
       const subHtml = subs.map((s) => {
         const sDot = dotClassFor(s.state, s.severity);
         const sSp = s.tokenSpeed || {};
-        const tpsText = sSp.latestTps != null
-          ? `<span class="row-tps ${s.isRunning ? '' : 'idle'}" title="${esc(formatTpsTooltip(sSp))}">${sSp.latestTps.toFixed(1)} t/s</span>`
-          : (s.isRunning ? '<span class="row-tps idle">测速中…</span>' : '');
+        const sGenerating = GENERATING_STATES.has(s.state);
+        const sRunning = RUNNING_STATES.has(s.state);
+        let tpsText = '';
+        if (sGenerating && sSp.turnLatestTps == null) {
+          tpsText = '<span class="row-tps idle">测速中…</span>';
+        } else if (sSp.turnLatestTps != null || sSp.latestTps != null) {
+          const sDispTps = (sRunning && sSp.turnLatestTps != null) ? sSp.turnLatestTps : sSp.latestTps;
+          tpsText = `<span class="row-tps ${sRunning ? '' : 'idle'}" title="${esc(formatTpsTooltip(sSp))}">${sDispTps.toFixed(1)} t/s</span>`;
+        }
         return `
           <div class="flat-row">
             <div class="flat-row-top">
@@ -447,15 +494,23 @@
   function buildFlatSessionRow(s) {
     const sDot = dotClassFor(s.state, s.severity);
     const sp = s.tokenSpeed || {};
-    const tpsHtml = sp.latestTps != null
-      ? `<span class="row-tps ${s.isActive ? '' : 'idle'}" title="${esc(formatTpsTooltip(sp))}">${sp.latestTps.toFixed(1)} t/s</span>`
-      : (s.isActive ? '<span class="row-tps idle">测速中…</span>' : '<span class="row-tps idle">—</span>');
+    const sGenerating = GENERATING_STATES.has(s.state);
+    const sRunning = RUNNING_STATES.has(s.state);
+    let tpsHtml;
+    if (sGenerating && sp.turnLatestTps == null) {
+      tpsHtml = '<span class="row-tps idle">测速中…</span>';
+    } else if (sp.turnLatestTps != null || sp.latestTps != null) {
+      const displayTps = (sRunning && sp.turnLatestTps != null) ? sp.turnLatestTps : sp.latestTps;
+      tpsHtml = `<span class="row-tps ${sRunning ? '' : 'idle'}" title="${esc(formatTpsTooltip(sp))}">${displayTps.toFixed(1)} t/s</span>`;
+    } else {
+      tpsHtml = '<span class="row-tps idle">—</span>';
+    }
 
     const subParts = [s.badge];
     if (s.milestoneLabel) subParts.push(`阶段 ${s.milestoneLabel}`);
     if (sp.avgTps != null) subParts.push(`均值 ${sp.avgTps.toFixed(1)} t/s`);
     if (s.compactHint?.needed) subParts.push(s.compactHint.label || '建议压缩');
-    if (s.isActive && s.headline) subParts.push(s.headline);
+    if (s.headline && (s.isActive || s.state === 'ERROR_STOPPED')) subParts.push(s.headline);
 
     return `
       <div class="flat-row interactive js-pick-session" data-conv="${esc(s.conversationId)}">
@@ -601,10 +656,12 @@
     if (!h) return;
 
     const estServerNow = Date.now() + state.serverClockSkewMs;
-    const isLive = LIVE_STATES.has(h.state);
+    const isActivelyTicking = RUNNING_STATES.has(h.state)
+      || h.state === 'STUCK_SUSPECTED'
+      || (h.state === 'WAITING_USER' && h.turnDurationSec == null);
 
-    // 右上角秒表仅在实时运行态显示，已结束时隐藏（避免与下方“本轮耗时”重复）
-    if (isLive && h.startedAtMs) {
+    // 右上角秒表仅在实时运行态或阻塞待确认中显示，已停机/审阅静态方案时隐藏
+    if (isActivelyTicking && h.startedAtMs) {
       const liveStepSec = Math.max(0, Math.floor((estServerNow - h.startedAtMs) / 1000));
       $('hero-timer').textContent = fmtClockTimer(liveStepSec);
       $('hero-timer').classList.remove('hidden');
@@ -612,7 +669,7 @@
       $('hero-timer').classList.add('hidden');
     }
 
-    if (isLive && h.turnStartedAtMs) {
+    if (isActivelyTicking && h.turnStartedAtMs) {
       const liveTurnSec = Math.max(0, Math.floor((estServerNow - h.turnStartedAtMs) / 1000));
       $('metric-dur').textContent = fmtShortDur(liveTurnSec);
     } else {
@@ -624,10 +681,22 @@
   // ---------- 轮询循环 ----------
   let pollTimer = null;
   async function pollOnce() {
+    const currentHostConv = hostConvId();
+    if (currentHostConv !== state.lastHostConvId) {
+      state.lastHostConvId = currentHostConv;
+      state.deletedHostConvId = '';
+      state.overrideConvId = '';
+      state.etag = '';
+    }
+
     const targetConv = activeTargetConvId();
     try {
       const qs = new URLSearchParams();
-      if (targetConv) qs.set('conversationId', targetConv);
+      if (targetConv) {
+        qs.set('conversationId', targetConv);
+      } else if (window.sidecar) {
+        qs.set('conversationId', '__none__');
+      }
       if (state.etag) qs.set('etag', state.etag);
 
       const data = await apiGet(`/api/state?${qs.toString()}`);
@@ -641,6 +710,19 @@
       if (Number.isFinite(data.serverNow)) {
         state.serverClockSkewMs = data.serverNow - Date.now();
       }
+
+      if (targetConv && data.current?.deleted) {
+        if (state.overrideConvId === targetConv) {
+          state.overrideConvId = '';
+          state.etag = '';
+          showToast('该会话已删除，已切回当前窗口');
+          clearTimeout(pollTimer);
+          pollTimer = setTimeout(pollOnce, 60);
+          return;
+        }
+        state.deletedHostConvId = targetConv;
+      }
+
       if (!data.unchanged) {
         state.etag = data.etag || '';
         state.snap = data;
@@ -714,14 +796,20 @@
     if (openHostBtn) {
       e.stopPropagation();
       const cid = openHostBtn.dataset.conv;
-      if (cid && window.sidecar?.ui?.toggleConversation) {
-        window.sidecar.ui.toggleConversation(cid);
+      if (cid) {
+        state.overrideConvId = cid === hostConvId() ? '' : cid;
+        state.etag = '';
+        if (window.sidecar?.ui?.toggleConversation) {
+          window.sidecar.ui.toggleConversation(cid);
+        }
+        pollOnce();
       }
       return;
     }
     const row = e.target.closest('.js-pick-session');
     if (row) {
-      state.overrideConvId = row.dataset.conv || '';
+      const cid = row.dataset.conv || '';
+      state.overrideConvId = cid === hostConvId() ? '' : cid;
       state.etag = '';
       pollOnce();
     }

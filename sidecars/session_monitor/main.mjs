@@ -13,6 +13,7 @@ import {
   realpathSync,
   renameSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
@@ -38,7 +39,7 @@ const ID_RE = /^[0-9a-fA-F-]{8,64}$/;
 const BOOTED_AT = Date.now();
 const GLOBAL_LOOKBACK_MS = 8 * 60 * 60 * 1000; // Scan sessions active in last 8h
 const PS_TTL_MS = 2000;
-const GLOBAL_SCAN_TTL_MS = 2500;
+const GLOBAL_SCAN_TTL_MS = 1000;
 
 const STATIC_ASSETS = {
   '/styles.css': ['styles.css', 'text/css; charset=utf-8'],
@@ -132,20 +133,45 @@ function sqliteFileSig(dbPath) {
   const dbSt = statOf(dbPath);
   if (!dbSt.isFile || dbSt.size <= 0) return '';
   const walSt = statOf(`${dbPath}-wal`);
-  return `${Math.round(dbSt.mtime)}:${dbSt.size}|${Math.round(walSt.mtime)}:${walSt.size}`;
+  const shmSt = statOf(`${dbPath}-shm`);
+  return `${dbSt.mtime}:${dbSt.size}|${walSt.mtime}:${walSt.size}|${shmSt.mtime}:${shmSt.size}`;
+}
+
+function parseWorkspaceUris(raw) {
+  if (!raw || typeof raw !== 'string') return [];
+  try {
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return [];
+    const out = [];
+    for (const u of arr) {
+      if (typeof u !== 'string' || !u) continue;
+      if (u.startsWith('file://')) {
+        try {
+          out.push(fileURLToPath(u));
+        } catch {
+          out.push(decodeURIComponent(u.slice(7)));
+        }
+      } else {
+        out.push(u);
+      }
+    }
+    return out;
+  } catch {
+    return [];
+  }
 }
 
 const summaryDbCache = new Map(); // appData -> { sig, byId: Map }
 
-function getSummaryRow(appData, convId) {
-  if (!DatabaseSync || !appData || !convId) return null;
+function loadSummaryMap(appData) {
+  if (!DatabaseSync || !appData) return null;
   const dbPath = join(appData, 'conversation_summaries.db');
   const sig = sqliteFileSig(dbPath);
   if (!sig) return null;
 
   const cached = summaryDbCache.get(appData);
   if (cached && cached.sig === sig) {
-    return cached.byId.get(convId) || null;
+    return cached.byId;
   }
 
   let db = null;
@@ -153,33 +179,46 @@ function getSummaryRow(appData, convId) {
     db = new DatabaseSync(dbPath, { readOnly: true, timeout: 150 });
     const rows = db.prepare(
       `SELECT conversation_id, title, step_count, status, not_fully_idle, killed,
-              last_user_input_step_index, last_modified_time
+              parent_conversation_id, nesting_depth, agent_name, workspace_uris,
+              last_user_input_time, last_user_input_step_index, last_modified_time
        FROM conversation_summaries
        ORDER BY last_modified_time DESC
-       LIMIT 400`,
+       LIMIT 2000`,
     ).all();
     const byId = new Map();
     for (const r of rows) {
       if (!r?.conversation_id) continue;
       const rawTitle = typeof r.title === 'string' ? r.title.replace(/^\/[a-zA-Z0-9_-]+\s+/, '').trim() : '';
+      const workspacePaths = parseWorkspaceUris(r.workspace_uris);
       byId.set(r.conversation_id, {
         title: rawTitle ? oneLine(rawTitle, 90) : '',
         stepCount: Number.isFinite(r.step_count) ? Number(r.step_count) : null,
         cascadeStatus: typeof r.status === 'string' ? r.status : '',
         notFullyIdle: Boolean(r.not_fully_idle),
         killed: Boolean(r.killed),
+        parentConversationId: typeof r.parent_conversation_id === 'string' ? r.parent_conversation_id : '',
+        nestingDepth: Number.isFinite(r.nesting_depth) ? Number(r.nesting_depth) : 0,
+        agentName: typeof r.agent_name === 'string' ? r.agent_name : '',
+        workspacePaths,
+        lastUserInputMs: parseIsoMs(typeof r.last_user_input_time === 'string' ? r.last_user_input_time : ''),
         lastUserInputStepIndex: Number.isFinite(r.last_user_input_step_index) ? Number(r.last_user_input_step_index) : -1,
         lastModifiedMs: parseIsoMs(typeof r.last_modified_time === 'string' ? r.last_modified_time : ''),
       });
     }
     if (summaryDbCache.size > 8) summaryDbCache.clear();
     summaryDbCache.set(appData, { sig, byId });
-    return byId.get(convId) || null;
+    return byId;
   } catch {
-    return cached?.byId?.get(convId) || null;
+    return cached?.byId || null;
   } finally {
     try { db?.close(); } catch {}
   }
+}
+
+function getSummaryRow(appData, convId) {
+  if (!appData || !convId) return null;
+  const byId = loadSummaryMap(appData);
+  return byId ? (byId.get(convId) || null) : null;
 }
 
 const convDbCache = new Map(); // dbPath -> { sig, info }
@@ -197,7 +236,7 @@ function readConvDbStepsInfo(appData, convId) {
   try {
     db = new DatabaseSync(dbPath, { readOnly: true, timeout: 150 });
     const tailRows = db.prepare(
-      'SELECT idx, step_type AS stepType, status FROM steps ORDER BY idx DESC LIMIT 12',
+      'SELECT idx, step_type AS stepType, status FROM steps ORDER BY idx DESC LIMIT 32',
     ).all();
     const liveStepCount = tailRows.length > 0 && Number.isFinite(tailRows[0].idx)
       ? Number(tailRows[0].idx) + 1
@@ -224,18 +263,22 @@ function readConvDbStepsInfo(appData, convId) {
 
     // CortexStepStatus: 1=PENDING, 2=RUNNING, 3=DONE, 4=INVALID, 5=CLEARED,
     // 6=CANCELED, 7=ERROR, 8=GENERATING, 9=WAITING, 11=QUEUED, 12=INTERRUPTED
+    const tailStatus = tailRows.length > 0 ? Number(tailRows[0].status) : null;
     const hasWaitingStep = batchAfterPlanner.some((s) => s.status === 9);
-    const hasRunningStep = tailRows[0]?.status === 8
+    const hasRunningStep = tailStatus === 8
       || batchAfterPlanner.some((s) => s.status === 1 || s.status === 2 || s.status === 8 || s.status === 11);
-    const hasCanceledTailStep = batchAfterPlanner.length > 0
-      && batchAfterPlanner.every((s) => [3, 4, 5, 6, 7, 12].includes(s.status))
-      && batchAfterPlanner.some((s) => s.status === 5 || s.status === 6 || s.status === 12);
+    const hasCanceledTailStep = (tailStatus === 5 || tailStatus === 6 || tailStatus === 12)
+      || (
+        batchAfterPlanner.length > 0
+        && batchAfterPlanner.every((s) => [3, 4, 5, 6, 7, 12].includes(s.status))
+        && batchAfterPlanner.some((s) => s.status === 5 || s.status === 6 || s.status === 12)
+      );
 
     const info = {
       sig,
       liveStepCount,
       tailStepIdx: tailRows.length > 0 ? Number(tailRows[0].idx) : -1,
-      tailStepStatus: tailRows.length > 0 ? Number(tailRows[0].status) : null,
+      tailStepStatus: tailStatus,
       hasWaitingStep,
       hasRunningStep,
       hasCanceledTailStep,
@@ -262,22 +305,29 @@ function readRuntimeMeta(appData, convId) {
 
   const key = [
     liveStepCount ?? '-',
+    convDb?.sig || '-',
     convDb?.tailStepStatus ?? '-',
     convDb?.hasWaitingStep ? 1 : 0,
     convDb?.hasRunningStep ? 1 : 0,
     convDb?.hasCanceledTailStep ? 1 : 0,
     summary?.cascadeStatus || '-',
     summary?.notFullyIdle ? 1 : 0,
+    summary?.killed ? 1 : 0,
     summary?.lastModifiedMs || 0,
   ].join(':');
 
   return {
     key,
     title: summary?.title || '',
+    workspacePaths: summary?.workspacePaths || [],
+    parentConversationId: summary?.parentConversationId || '',
+    nestingDepth: summary?.nestingDepth || 0,
+    agentName: summary?.agentName || '',
     liveStepCount,
     cascadeStatus: summary?.cascadeStatus || '',
     notFullyIdle: Boolean(summary?.notFullyIdle),
     killed: Boolean(summary?.killed),
+    lastUserInputMs: summary?.lastUserInputMs || null,
     lastModifiedMs: summary?.lastModifiedMs || null,
     lastUserInputStepIndex: summary?.lastUserInputStepIndex ?? -1,
     tailStepStatus: convDb?.tailStepStatus ?? null,
@@ -346,6 +396,9 @@ let userSettings = loadSettings();
 const titleCache = new Map(); // convId -> string | Promise
 function resolveConversationTitle(convId, fallback = '') {
   if (!convId || !ID_RE.test(convId)) return fallback;
+  // When SQLite ground truth (`conversation_summaries.db`) is available, titles come directly from SQLite;
+  // avoid spawning `agentapi get-conversation-metadata` which lacks titles and writes event log files.
+  if (DatabaseSync) return fallback;
   const hit = titleCache.get(convId);
   if (typeof hit === 'string') return hit || fallback;
   if (!hit) {
@@ -458,12 +511,51 @@ function readConversationMilestones(appData, convId) {
 function readHookSession(appData, convId) {
   const p = join(appData, 'plugin_data', 'antigravity-session-monitor', 'sessions', `${convId}.json`);
   const f = readCached(p, 256 * 1024);
-  if (!f.text) return { key: '-', data: null };
+  if (!f.text) return { key: '-', data: null, mtime: f.mtime || 0, filePath: p };
   try {
-    return { key: f.key, data: JSON.parse(f.text) };
+    return { key: f.key, data: JSON.parse(f.text), mtime: f.mtime || 0, filePath: p };
   } catch {
-    return { key: '-', data: null };
+    return { key: '-', data: null, mtime: f.mtime || 0, filePath: p };
   }
+}
+
+/**
+ * Check whether `convId` still exists in Antigravity host storage.
+ * Deleting a conversation in Antigravity removes its row from `conversation_summaries.db`,
+ * removes `conversations/<id>.db`, and removes `brain/<id>`, but leaves behind our plugin's
+ * `plugin_data/antigravity-session-monitor/sessions/<id>.json` hook file.
+ */
+function isConversationAlive(appData, convId, summaryMap, hookEntry, now) {
+  if (!appData || !convId || !ID_RE.test(convId)) return false;
+  if (summaryMap && summaryMap.has(convId)) return true;
+  if (existsSync(join(appData, 'conversations', `${convId}.db`))) return true;
+  if (!DatabaseSync || (!summaryMap && !existsSync(join(appData, 'conversations')))) {
+    if (existsSync(join(appData, 'brain', convId))) return true;
+  }
+  const hookBirthMs = hookEntry?.data?.createdAt || hookEntry?.mtime || 0;
+  if (hookBirthMs > 0 && now - hookBirthMs < 2500 && hookEntry?.data?.phase !== 'stopped') {
+    return true;
+  }
+  return false;
+}
+
+function cleanupOrphanHookSession(appData, convId, now) {
+  if (!appData || !convId || !ID_RE.test(convId)) return;
+  const sessPath = join(appData, 'plugin_data', 'antigravity-session-monitor', 'sessions', `${convId}.json`);
+  const st = statOf(sessPath);
+  if (st.isFile && now - st.mtime > 3000) {
+    try {
+      unlinkSync(sessPath);
+    } catch {
+      // Ignore concurrent removal
+    }
+  }
+  fileCache.delete(sessPath);
+  const trPath = join(appData, 'brain', convId, '.system_generated', 'logs', 'transcript.jsonl');
+  fileCache.delete(trPath);
+  parsedTranscriptCache.delete(trPath);
+  convDbCache.delete(join(appData, 'conversations', `${convId}.db`));
+  titleCache.delete(convId);
 }
 
 // Read native swarm members if this conversation coordinates a swarm
@@ -484,6 +576,7 @@ function readSwarmSubagentRefs(appData, convId) {
         typeName: 'swarm',
         model: m.model || '',
         startedAtMs: null,
+        inCurrentTurn: true,
       });
     }
     return out;
@@ -495,10 +588,17 @@ function readSwarmSubagentRefs(appData, convId) {
 function locateConversationAppData(convId) {
   const dirs = findAppDataDirs();
   for (const d of dirs) {
+    const summaryMap = loadSummaryMap(d);
     if (
-      existsSync(join(d, 'brain', convId))
-      || existsSync(join(d, 'plugin_data', 'antigravity-session-monitor', 'sessions', `${convId}.json`))
+      summaryMap?.has(convId)
+      || existsSync(join(d, 'conversations', `${convId}.db`))
+      || existsSync(join(d, 'brain', convId))
     ) {
+      return d;
+    }
+  }
+  for (const d of dirs) {
+    if (existsSync(join(d, 'plugin_data', 'antigravity-session-monitor', 'sessions', `${convId}.json`))) {
       return d;
     }
   }
@@ -509,18 +609,26 @@ function locateConversationAppData(convId) {
 // Full & Lightweight Session Builders
 // ---------------------------------------------------------------------------
 
-function summarizeSubagent(appData, ref, psRows, now) {
+function summarizeSubagent(appData, ref, psRows, now, summaryMap = null) {
   const subId = ref.conversationId;
   const hook = readHookSession(appData, subId);
+  const effectiveSummaryMap = summaryMap || loadSummaryMap(appData);
+  if (!isConversationAlive(appData, subId, effectiveSummaryMap, hook, now)) {
+    cleanupOrphanHookSession(appData, subId, now);
+    return null;
+  }
   const runtimeMeta = readRuntimeMeta(appData, subId);
   const trEntry = getParsedTranscript(appData, subId, hook.data, runtimeMeta);
   const tr = trEntry.parsed;
+  const effectiveWorkspacePaths = hook.data?.workspacePaths?.length
+    ? hook.data.workspacePaths
+    : (runtimeMeta?.workspacePaths || []);
 
   let proc = null;
   if (tr.pendingTools[0]?.name === 'run_command') {
     proc = matchActiveProcess(psRows, {
       commandLine: tr.pendingTools[0].commandLine,
-      workspacePaths: hook.data?.workspacePaths || [],
+      workspacePaths: effectiveWorkspacePaths,
       ownPid: process.pid,
     });
   }
@@ -553,32 +661,59 @@ function summarizeSubagent(appData, ref, psRows, now) {
     tokens: tr.tokens,
     tokenSpeed: tr.tokenSpeed,
     isRunning,
-    key: `${hook.key}|${trEntry.key}|${health.state}|${tr.tokenSpeed.latestTps ?? '-'}`,
+    inCurrentTurn: ref.inCurrentTurn !== false,
+    key: `${hook.key}|${trEntry.key}|${health.state}|${tr.tokenSpeed.latestTps ?? '-'}|${tr.tokenSpeed.turnLatestTps ?? '-'}`,
+  };
+}
+
+function createEmptySnapshot(now, extra = {}) {
+  return {
+    conversationId: '',
+    found: false,
+    deleted: false,
+    etagPart: 'empty',
+    health: evaluateConversationHealth({ now, settings: userSettings }),
+    milestones: null,
+    subagents: [],
+    bgTasks: [],
+    rounds: [],
+    tokens: { input: 0, cache: 0, output: 0, currentContext: 0 },
+    tokenSpeed: {
+      latestTps: null,
+      turnLatestTps: null,
+      avgTps: null,
+      turnAvgTps: null,
+      peakTps: null,
+      measuredRounds: 0,
+    },
+    ...extra,
   };
 }
 
 function buildConversationSnapshot(convId, psRows, now) {
   if (!convId || !ID_RE.test(convId)) {
-    return {
-      conversationId: '',
-      found: false,
-      etagPart: 'empty',
-      health: evaluateConversationHealth({ now, settings: userSettings }),
-      milestones: null,
-      subagents: [],
-      bgTasks: [],
-      rounds: [],
-      tokens: { input: 0, cache: 0, output: 0, currentContext: 0 },
-      tokenSpeed: { latestTps: null, avgTps: null, peakTps: null, measuredRounds: 0 },
-    };
+    return createEmptySnapshot(now);
   }
 
   const appData = locateConversationAppData(convId);
+  const summaryMap = loadSummaryMap(appData);
   const hook = readHookSession(appData, convId);
+  if (!isConversationAlive(appData, convId, summaryMap, hook, now)) {
+    cleanupOrphanHookSession(appData, convId, now);
+    return createEmptySnapshot(now, {
+      requestedConversationId: convId,
+      deleted: true,
+      etagPart: `deleted:${convId}`,
+    });
+  }
+
   const runtimeMeta = readRuntimeMeta(appData, convId);
   const trEntry = getParsedTranscript(appData, convId, hook.data, runtimeMeta);
   const tr = trEntry.parsed;
   const msEntry = readConversationMilestones(appData, convId);
+  const effectiveWorkspacePaths = hook.data?.workspacePaths?.length
+    ? hook.data.workspacePaths
+    : (runtimeMeta?.workspacePaths || []);
 
   // Merge subagents from invoke_subagent + native swarm
   const subRefsMap = new Map();
@@ -587,10 +722,16 @@ function buildConversationSnapshot(convId, psRows, now) {
     if (!subRefsMap.has(r.conversationId)) subRefsMap.set(r.conversationId, r);
   }
 
-  const subagents = [...subRefsMap.values()].map((ref) => summarizeSubagent(appData, ref, psRows, now));
+  const subagents = [...subRefsMap.values()]
+    .map((ref) => summarizeSubagent(appData, ref, psRows, now, summaryMap))
+    .filter(Boolean);
   // Active / attention subagents first, then newest
   subagents.sort((a, b) => {
-    const rank = (s) => (s.severity === 'danger' || s.severity === 'warning' ? 0 : (s.isRunning ? 1 : 2));
+    const rank = (s) => (
+      s.isRunning && (s.severity === 'danger' || s.severity === 'warning')
+        ? 0
+        : (s.isRunning ? 1 : 2)
+    );
     return rank(a) - rank(b);
   });
 
@@ -598,7 +739,7 @@ function buildConversationSnapshot(convId, psRows, now) {
   if (tr.pendingTools[0]?.name === 'run_command') {
     proc = matchActiveProcess(psRows, {
       commandLine: tr.pendingTools[0].commandLine,
-      workspacePaths: hook.data?.workspacePaths || [],
+      workspacePaths: effectiveWorkspacePaths,
       ownPid: process.pid,
     });
   }
@@ -616,8 +757,8 @@ function buildConversationSnapshot(convId, psRows, now) {
   const rawFallbackTitle = runtimeMeta?.title || tr.titleCandidate || hook.data?.firstUserInput || hook.data?.lastUserInput || '';
   const fallbackTitle = String(rawFallbackTitle).replace(/^\/[a-zA-Z0-9_-]+\s+/, '');
   const title = runtimeMeta?.title || resolveConversationTitle(convId, fallbackTitle);
-  const workspaceName = Array.isArray(hook.data?.workspacePaths) && hook.data.workspacePaths[0]
-    ? basename(hook.data.workspacePaths[0])
+  const workspaceName = effectiveWorkspacePaths[0]
+    ? basename(effectiveWorkspacePaths[0])
     : '';
 
   // Aggregate total tokens including subagents
@@ -631,6 +772,15 @@ function buildConversationSnapshot(convId, psRows, now) {
   );
 
   const isEndedState = ['IDLE', 'COMPLETED', 'ERROR_STOPPED'].includes(health.state);
+  const cascadeFullyStopped = Boolean(
+    isEndedState
+    || (hook.data?.phase === 'stopped' && hook.data?.stop?.fullyIdle)
+    || (runtimeMeta && (runtimeMeta.killed || (runtimeMeta.cascadeStatus === 'CASCADE_RUN_STATUS_IDLE' && !runtimeMeta.notFullyIdle))),
+  );
+  const activeBgTasks = cascadeFullyStopped
+    ? []
+    : tr.bgTasks.filter((b) => b.status === 'running');
+
   const totalTurnSec = health.turnDurationSec != null
     ? health.turnDurationSec
     : (!isEndedState && health.turnStartedAtMs ? Math.max(0, Math.round((now - health.turnStartedAtMs) / 1000)) : 0);
@@ -664,12 +814,17 @@ function buildConversationSnapshot(convId, psRows, now) {
     msEntry.key,
     health.state,
     health.badge,
+    health.headline,
     cpuBucket,
     tr.tokenSpeed.latestTps ?? '-',
+    tr.tokenSpeed.turnLatestTps ?? '-',
+    tr.tokenSpeed.turnAvgTps ?? '-',
     activeSubagentTpsSum,
+    activeBgTasks.length,
     compactHint?.level ?? '-',
     isCompacting ? 1 : 0,
     revertedStepsTotal,
+    workspaceName,
     title,
     subagents.map((s) => s.key).join(','),
   ].join('|');
@@ -680,6 +835,7 @@ function buildConversationSnapshot(convId, psRows, now) {
   return {
     conversationId: convId,
     found: Boolean(hook.data || tr.stepCount > 0 || runtimeMeta || msEntry.milestones),
+    deleted: false,
     title: title || '当前会话',
     workspaceName,
     etagPart,
@@ -690,7 +846,7 @@ function buildConversationSnapshot(convId, psRows, now) {
     },
     milestones: msEntry.milestones,
     subagents,
-    bgTasks: tr.bgTasks.filter((b) => b.status === 'running'),
+    bgTasks: activeBgTasks,
     rounds: timelineRounds,
     totalRounds: tr.rounds.filter((r) => r.kind === 'planner').length,
     stepCount: tr.stepCount,
@@ -714,68 +870,137 @@ function buildConversationSnapshot(convId, psRows, now) {
 }
 
 // ---------------------------------------------------------------------------
-// Global Parallel Sessions Scanner (Cached 2.5s)
+// Global Parallel Sessions Scanner (Stat-invalidated + 1s TTL)
 // ---------------------------------------------------------------------------
 
-let globalCache = { at: 0, items: [], key: '' };
+let globalCache = { at: 0, sig: '', items: [], key: '' };
 
 function getGlobalSessions(psRows, now) {
-  if (now - globalCache.at < GLOBAL_SCAN_TTL_MS) return globalCache;
+  const appDataDirs = findAppDataDirs();
+  const sigParts = [];
+  for (const appData of appDataDirs) {
+    const sumSig = sqliteFileSig(join(appData, 'conversation_summaries.db'));
+    const sessSt = statOf(join(appData, 'plugin_data', 'antigravity-session-monitor', 'sessions'));
+    const convDirSt = statOf(join(appData, 'conversations'));
+    const brainDirSt = statOf(join(appData, 'brain'));
+    sigParts.push(`${appData}:${sumSig}:${sessSt.mtime}:${convDirSt.mtime}:${brainDirSt.mtime}`);
+  }
+  const scanSig = sigParts.join('||');
 
-  const candidateIds = new Map(); // convId -> { appData, mtime }
-  for (const appData of findAppDataDirs()) {
+  if (now - globalCache.at < GLOBAL_SCAN_TTL_MS && globalCache.sig === scanSig) {
+    return globalCache;
+  }
+
+  const candidateIds = new Map(); // convId -> { appData, mtime, summaryMap }
+  for (const appData of appDataDirs) {
+    const summaryMap = loadSummaryMap(appData);
+    if (summaryMap) {
+      for (const [id, s] of summaryMap.entries()) {
+        if (!ID_RE.test(id)) continue;
+        if (s.parentConversationId || s.nestingDepth > 0 || s.agentName) continue;
+        const isCascadeActive = Boolean(
+          !s.killed && ((s.cascadeStatus && s.cascadeStatus !== 'CASCADE_RUN_STATUS_IDLE') || s.notFullyIdle),
+        );
+        const recentMs = Math.max(s.lastModifiedMs || 0, s.lastUserInputMs || 0);
+        if (isCascadeActive || (recentMs > 0 && now - recentMs <= GLOBAL_LOOKBACK_MS)) {
+          const effectiveMtime = isCascadeActive ? Math.max(recentMs, now - 1000) : recentMs;
+          candidateIds.set(id, { appData, mtime: effectiveMtime, summaryMap });
+        }
+      }
+    }
+
     const sessDir = join(appData, 'plugin_data', 'antigravity-session-monitor', 'sessions');
     for (const f of safeReaddir(sessDir)) {
       if (!f.endsWith('.json')) continue;
       const id = f.slice(0, -5);
       if (!ID_RE.test(id)) continue;
-      const mtime = statOf(join(sessDir, f)).mtime;
-      if (now - mtime <= GLOBAL_LOOKBACK_MS) {
-        candidateIds.set(id, { appData, mtime });
+      const hook = readHookSession(appData, id);
+      if (!isConversationAlive(appData, id, summaryMap, hook, now)) {
+        cleanupOrphanHookSession(appData, id, now);
+        continue;
+      }
+      const sRow = summaryMap?.get(id);
+      if (sRow && (sRow.parentConversationId || sRow.nestingDepth > 0 || sRow.agentName)) continue;
+      const mtime = Math.max(hook.mtime || 0, hook.data?.updatedAt || 0);
+      if (mtime > 0 && now - mtime <= GLOBAL_LOOKBACK_MS) {
+        const prev = candidateIds.get(id);
+        if (!prev || mtime > prev.mtime) candidateIds.set(id, { appData, mtime, summaryMap });
       }
     }
+
     const brainDir = join(appData, 'brain');
     for (const id of safeReaddir(brainDir)) {
       if (!ID_RE.test(id)) continue;
+      if (!isConversationAlive(appData, id, summaryMap, null, now)) continue;
+      const sRow = summaryMap?.get(id);
+      if (sRow && (sRow.parentConversationId || sRow.nestingDepth > 0 || sRow.agentName)) continue;
       const tp = join(brainDir, id, '.system_generated', 'logs', 'transcript.jsonl');
       const mtime = statOf(tp).mtime;
       if (mtime > 0 && now - mtime <= GLOBAL_LOOKBACK_MS) {
         const prev = candidateIds.get(id);
-        if (!prev || mtime > prev.mtime) candidateIds.set(id, { appData, mtime });
+        if (!prev || mtime > prev.mtime) candidateIds.set(id, { appData, mtime, summaryMap });
       }
     }
   }
 
-  // Sort newest first and inspect top 16 recent sessions
+  // Sort newest first and inspect top 20 recent live sessions
   const sorted = [...candidateIds.entries()]
     .sort((a, b) => b[1].mtime - a[1].mtime)
-    .slice(0, 16);
+    .slice(0, 20);
 
   // Track child subagent IDs so we don't duplicate subagents as top-level conversations
   const childSubagentIds = new Set();
   const rawSummaries = [];
 
-  for (const [id, { appData, mtime }] of sorted) {
+  for (const [id, { appData, mtime, summaryMap }] of sorted) {
     const hook = readHookSession(appData, id);
+    if (!isConversationAlive(appData, id, summaryMap, hook, now)) {
+      cleanupOrphanHookSession(appData, id, now);
+      continue;
+    }
     const runtimeMeta = readRuntimeMeta(appData, id);
     const trEntry = getParsedTranscript(appData, id, hook.data, runtimeMeta);
+    const swarmRefs = readSwarmSubagentRefs(appData, id);
     for (const sr of trEntry.parsed.subagentRefs) {
       childSubagentIds.add(sr.conversationId);
     }
-    for (const sr of readSwarmSubagentRefs(appData, id)) {
+    for (const sr of swarmRefs) {
       childSubagentIds.add(sr.conversationId);
     }
-    rawSummaries.push({ id, appData, mtime, hook, runtimeMeta, tr: trEntry.parsed });
+    rawSummaries.push({ id, appData, mtime, summaryMap, hook, runtimeMeta, tr: trEntry.parsed, swarmRefs });
   }
 
   const items = [];
-  for (const { id, appData, mtime, hook, runtimeMeta, tr } of rawSummaries) {
-    if (childSubagentIds.has(id)) continue;
+  for (const { id, appData, mtime, summaryMap, hook, runtimeMeta, tr, swarmRefs } of rawSummaries) {
+    if (
+      childSubagentIds.has(id)
+      || runtimeMeta?.parentConversationId
+      || (runtimeMeta?.nestingDepth || 0) > 0
+      || runtimeMeta?.agentName
+    ) {
+      continue;
+    }
+
+    const effectiveWorkspacePaths = hook.data?.workspacePaths?.length
+      ? hook.data.workspacePaths
+      : (runtimeMeta?.workspacePaths || []);
+
+    const subRefsMap = new Map();
+    for (const sr of tr.subagentRefs) subRefsMap.set(sr.conversationId, sr);
+    for (const sr of swarmRefs) {
+      if (!subRefsMap.has(sr.conversationId)) subRefsMap.set(sr.conversationId, sr);
+    }
+    const subagents = subRefsMap.size > 0
+      ? [...subRefsMap.values()]
+        .map((ref) => summarizeSubagent(appData, ref, psRows, now, summaryMap))
+        .filter(Boolean)
+      : [];
+
     let proc = null;
     if (tr.pendingTools[0]?.name === 'run_command') {
       proc = matchActiveProcess(psRows, {
         commandLine: tr.pendingTools[0].commandLine,
-        workspacePaths: hook.data?.workspacePaths || [],
+        workspacePaths: effectiveWorkspacePaths,
         ownPid: process.pid,
       });
     }
@@ -783,7 +1008,7 @@ function getGlobalSessions(psRows, now) {
       now,
       hookState: hook.data,
       transcript: tr,
-      subagents: [],
+      subagents,
       proc,
       runtimeMeta,
       settings: userSettings,
@@ -792,11 +1017,12 @@ function getGlobalSessions(psRows, now) {
     const rawFallbackTitle = runtimeMeta?.title || tr.titleCandidate || hook.data?.firstUserInput || hook.data?.lastUserInput || id.slice(0, 8);
     const fallbackTitle = String(rawFallbackTitle).replace(/^\/[a-zA-Z0-9_-]+\s+/, '');
     const title = runtimeMeta?.title || resolveConversationTitle(id, fallbackTitle);
-    const workspaceName = Array.isArray(hook.data?.workspacePaths) && hook.data.workspacePaths[0]
-      ? basename(hook.data.workspacePaths[0])
+    const workspaceName = effectiveWorkspacePaths[0]
+      ? basename(effectiveWorkspacePaths[0])
       : '';
 
-    const isActive = !['IDLE', 'COMPLETED'].includes(health.state);
+    // Terminated tasks (`IDLE`, `COMPLETED`, `ERROR_STOPPED`) belong to ended history, never "running tasks"
+    const isActive = !['IDLE', 'COMPLETED', 'ERROR_STOPPED'].includes(health.state);
     items.push({
       conversationId: id,
       title: title || `会话 ${id.slice(0, 8)}`,
@@ -828,10 +1054,10 @@ function getGlobalSessions(psRows, now) {
     });
   }
 
-  // Sort: attention/warning first, then active running, then recently completed
+  // Sort: active attention/warning first, then active running, then ended sessions strictly by recency
   items.sort((a, b) => {
     const prio = (x) => {
-      if (x.severity === 'danger' || x.severity === 'warning' || x.severity === 'action_required') return 0;
+      if (x.isActive && (x.severity === 'danger' || x.severity === 'warning' || x.severity === 'action_required')) return 0;
       if (x.isActive) return 1;
       return 2;
     };
@@ -839,9 +1065,21 @@ function getGlobalSessions(psRows, now) {
   });
 
   const key = items.map(
-    (i) => `${i.conversationId}:${i.state}:${i.badge}:${i.milestoneLabel}:${i.tokenSpeed?.latestTps ?? '-'}:${i.compactHint?.level ?? '-'}`,
+    (i) => [
+      i.conversationId,
+      i.isActive ? 1 : 0,
+      i.state,
+      i.badge,
+      i.headline,
+      i.milestoneLabel,
+      i.tokenSpeed?.latestTps ?? '-',
+      i.tokenSpeed?.turnLatestTps ?? '-',
+      i.compactHint?.level ?? '-',
+      i.workspaceName,
+      i.title,
+    ].join(':'),
   ).join(';');
-  globalCache = { at: now, items: items.slice(0, 12), key };
+  globalCache = { at: now, sig: scanSig, items: items.slice(0, 12), key };
   return globalCache;
 }
 
@@ -929,9 +1167,12 @@ for (const [route, [filename, mime]] of Object.entries(STATIC_ASSETS)) {
 
 const handleStateRequest = async (data) => {
   const now = Date.now();
-  const rawConv = typeof data?.conversationId === 'string' && data.conversationId
-    ? data.conversationId
-    : (app.config.conversationId || '');
+  const explicitNone = data?.conversationId === '__none__';
+  const rawConv = explicitNone
+    ? ''
+    : (typeof data?.conversationId === 'string' && data.conversationId
+      ? data.conversationId
+      : (app.config.conversationId || ''));
   const convId = ID_RE.test(rawConv) ? rawConv : '';
 
   const psRows = await refreshPsRows();
@@ -939,7 +1180,7 @@ const handleStateRequest = async (data) => {
   const global = getGlobalSessions(psRows, now);
   const activeCount = global.items.filter((it) => it.isActive).length;
   const attentionCount = global.items.filter(
-    (it) => it.severity === 'warning' || it.severity === 'danger' || it.severity === 'action_required',
+    (it) => it.isActive && (it.severity === 'warning' || it.severity === 'danger' || it.severity === 'action_required'),
   ).length;
 
   const uiBuildKey = computeUiBuildKey();
@@ -952,7 +1193,7 @@ const handleStateRequest = async (data) => {
       etag: fullEtag,
       uiBuildKey,
       serverNow: now,
-      conversationId: convId,
+      conversationId: current.conversationId,
     };
   }
 
@@ -961,7 +1202,7 @@ const handleStateRequest = async (data) => {
     etag: fullEtag,
     uiBuildKey,
     serverNow: now,
-    conversationId: convId,
+    conversationId: current.conversationId,
     settings: userSettings,
     current,
     global: {
