@@ -26,6 +26,8 @@
     settings: null,
     tab: 'overview',
     tlFilter: 'all',
+    netScope: 'today',
+    guScope: 'all',
     drawerSettingsOpen: false,
     nudgeOpen: false,
     prevHealthState: '',
@@ -102,6 +104,67 @@
     return v.toLocaleString();
   }
 
+  function fmtBytes(bytes) {
+    const b = Math.max(0, Number(bytes) || 0);
+    if (b < 1024) return `${Math.round(b)} B`;
+    if (b < 1024 * 1024) return `${(b / 1024).toFixed(b >= 100 * 1024 ? 0 : 1)} KB`;
+    if (b < 1024 * 1024 * 1024) return `${(b / (1024 * 1024)).toFixed(b >= 100 * 1024 * 1024 ? 1 : 2)} MB`;
+    return `${(b / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  }
+
+  function fmtByteRate(bps) {
+    const v = Math.max(0, Number(bps) || 0);
+    if (v < 1) return '0 B/s';
+    if (v < 1024) return `${Math.round(v)} B/s`;
+    if (v < 1024 * 1024) return `${(v / 1024).toFixed(v >= 100 * 1024 ? 0 : 1)} KB/s`;
+    return `${(v / (1024 * 1024)).toFixed(2)} MB/s`;
+  }
+
+  function fmtByteRateCompact(bps) {
+    const v = Math.max(0, Number(bps) || 0);
+    if (v < 1) return '0B/s';
+    if (v < 1024) return `${Math.round(v)}B/s`;
+    if (v < 1024 * 1024) return `${(v / 1024).toFixed(v >= 100 * 1024 ? 0 : 1)}K/s`;
+    return `${(v / (1024 * 1024)).toFixed(1)}M/s`;
+  }
+
+  function fmtMsShort(ms) {
+    const v = Number(ms);
+    if (!Number.isFinite(v) || v < 0) return '—';
+    if (v < 1000) return `${Math.round(v)}ms`;
+    if (v < 60_000) return `${(v / 1000).toFixed(1)}s`;
+    return fmtShortDur(v / 1000);
+  }
+
+  function fmtDateTimeShort(ms) {
+    if (!Number.isFinite(ms) || ms <= 0) return '';
+    const d = new Date(ms);
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    return `${m}-${day} ${hh}:${mm}`;
+  }
+
+  function fmtResetCountdown(resetAtMs, nowMs) {
+    if (!Number.isFinite(resetAtMs)) return '';
+    const diffSec = Math.max(0, Math.round((resetAtMs - nowMs) / 1000));
+    if (diffSec < 60) return '即将重置';
+    if (diffSec >= 86400) {
+      const days = Math.floor(diffSec / 86400);
+      const hrs = Math.floor((diffSec % 86400) / 3600);
+      return `${days}天${hrs > 0 ? `${hrs}h` : ''}后重置`;
+    }
+    return `${fmtShortDur(diffSec)}后重置`;
+  }
+
+  function cacheToneClass(rate) {
+    if (rate == null || !Number.isFinite(Number(rate))) return '';
+    if (rate >= 85) return 'is-cache-high';
+    if (rate >= 60) return 'is-cache-mid';
+    return 'is-cache-low';
+  }
+
   function fmtTimeOfDay(ms) {
     if (!Number.isFinite(ms)) return '';
     return new Date(ms).toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
@@ -118,11 +181,15 @@
   }
 
   function formatTpsTooltip(ts) {
-    if (!ts || ts.latestTps == null) return '等待首轮模型生成完成后计算生成速度';
+    if (!ts || (ts.latestTps == null && ts.decodeTps == null)) return '等待首轮模型生成完成后计算生成速度';
     return [
-      `最新一轮：${ts.latestTps.toFixed(1)} t/s${ts.latestOutTokens ? `（${ts.latestOutTokens.toLocaleString()} t / ${ts.latestGenSec ?? '?'}s）` : ''}`,
+      ts.latestTps != null
+        ? `最新一轮：${ts.latestTps.toFixed(1)} t/s${ts.latestOutTokens ? `（${ts.latestOutTokens.toLocaleString()} t / ${ts.latestGenSec ?? '?'}s）` : ''}`
+        : '',
       ts.avgTps != null ? `任务均值：${ts.avgTps.toFixed(1)} t/s` : '',
       ts.peakTps != null ? `历史峰值：${ts.peakTps.toFixed(1)} t/s` : '',
+      ts.latestDecodeTps != null ? `最新流式解码：${ts.latestDecodeTps.toFixed(1)} t/s` : '',
+      ts.decodeTps != null ? `均值流式解码：${ts.decodeTps.toFixed(1)} t/s` : '',
       ts.activeSubagentTpsSum ? `并发子代理合算：${ts.activeSubagentTpsSum.toFixed(1)} t/s` : '',
     ].filter(Boolean).join('\n');
   }
@@ -299,14 +366,96 @@
       : `累计 ${totalRounds} 轮 / ${cur.stepCount || 0} 步`;
 
     const tok = cur.tokens || {};
+    const sm = cur.metrics || null;
+    const net = snap.network || null;
+    const quota = snap.quota || null;
+
     $('metric-ctx').textContent = fmtTokens(tok.currentContext || 0);
-    $('metric-out').textContent = `输出 ${fmtTokens(tok.grandTotalOutput || tok.output || 0)}`;
+    $('metric-out').textContent = tok.contextUsagePercent != null
+      ? `${tok.contextUsagePercent.toFixed(0)}% · 出${fmtTokens(tok.grandTotalOutput || tok.output || 0)}`
+      : `输出 ${fmtTokens(tok.grandTotalOutput || tok.output || 0)}`;
     $('metric-tok-box').title = [
-      `当前上下文窗口占用：${(tok.currentContext || 0).toLocaleString()} t（~26万 t 触发自动压缩）`,
-      `累计输入：${(tok.input || 0).toLocaleString()} t`,
+      `当前上下文窗口占用：${(tok.currentContext || 0).toLocaleString()} t${tok.maxContextTokens ? ` / ${tok.maxContextTokens.toLocaleString()} t（${tok.contextUsagePercent ?? 0}%）` : '（~26万 t 触发自动压缩）'}`,
+      `未命中输入：${(tok.input || 0).toLocaleString()} t`,
       `缓存命中：${(tok.cache || 0).toLocaleString()} t`,
-      `主会话输出：${(tok.output || 0).toLocaleString()} t`,
+      tok.cacheWrite ? `缓存写入：${tok.cacheWrite.toLocaleString()} t` : '',
+      `主会话输出：${(tok.output || 0).toLocaleString()} t${sm?.tokens?.hasThinkingBreakdown ? `（思考 ${(tok.thinkingOutput || 0).toLocaleString()} / 正文 ${(tok.responseOutput || 0).toLocaleString()}）` : ''}`,
       tok.subagentOutput ? `子代理输出：${tok.subagentOutput.toLocaleString()} t` : '',
+      sm?.tokens?.latestPromptBytes ? `最新单次 Prompt 载荷：${fmtBytes(sm.tokens.latestPromptBytes)}` : '',
+    ].filter(Boolean).join('\n');
+
+    // 第二行核心遥测：缓存命中率 / AGY 服务端流量 / 累计词元与首字延迟
+    const hitRate = sm?.cache?.grandHitRate ?? sm?.cache?.hitRate ?? tok.grandCacheHitRate ?? tok.cacheHitRate ?? null;
+    const mainOnlyHitRate = sm?.cache?.hitRate ?? tok.cacheHitRate ?? null;
+    const latestHitRate = sm?.cache?.latestHitRate ?? tok.latestCacheHitRate ?? null;
+    const hasSubTokens = (sm?.tokens?.subagentTotalTokens || 0) > 0;
+    const cacheValEl = $('metric-cache');
+    cacheValEl.className = `metric-val tabular ${cacheToneClass(hitRate)}`;
+    cacheValEl.textContent = hitRate != null ? `${hitRate.toFixed(1)}%` : '—';
+    $('metric-cache-sub').textContent = latestHitRate != null
+      ? `本轮 ${latestHitRate.toFixed(1)}%`
+      : (hitRate != null ? `命中 ${fmtTokens(sm?.cache?.savedTokens ?? tok.cache ?? 0)}` : '暂无数据');
+    $('metric-cache-box').title = [
+      hitRate != null ? `本会话累计缓存命中率${hasSubTokens ? '（含子代理）' : ''}：${hitRate.toFixed(1)}%` : '等待首次模型返回统计缓存命中率',
+      hasSubTokens && mainOnlyHitRate != null ? `主会话单独命中率：${mainOnlyHitRate.toFixed(1)}%` : '',
+      latestHitRate != null ? `最新一轮缓存命中率：${latestHitRate.toFixed(1)}%` : '',
+      `缓存命中读取：${(sm?.cache?.savedTokens ?? tok.cache ?? 0).toLocaleString()} t`,
+      `未命中新输入：${((tok.input || 0) + (tok.subagentInput || 0)).toLocaleString()} t`,
+      (sm?.cache?.cacheWriteTokens || tok.cacheWrite) ? `缓存写入：${(sm?.cache?.cacheWriteTokens || tok.cacheWrite).toLocaleString()} t` : '',
+      '点击查看完整流量与缓存明细',
+    ].filter(Boolean).join('\n');
+
+    const netValEl = $('metric-net');
+    const netSubEl = $('metric-net-sub');
+    if (net?.available) {
+      const todayBucket = net.today || { in: 0, out: 0, total: 0 };
+      const todayTotal = todayBucket.total || 0;
+      const allTotal = net.allTime?.total || 0;
+      // 始终以 AGY 今日累计通信流量作为主值，清零或跨日后立即归零，不回退到旧活跃连接字节数
+      netValEl.textContent = fmtBytes(todayTotal);
+      const totalRate = net.rates?.totalBps || 0;
+      netValEl.classList.toggle('is-live-speed', totalRate >= 1024);
+      if (totalRate >= 512) {
+        netSubEl.textContent = `↑${fmtByteRateCompact(net.rates.outBps)} ↓${fmtByteRateCompact(net.rates.inBps)}`;
+      } else if (allTotal > todayTotal) {
+        netSubEl.textContent = `累计 ${fmtBytes(allTotal)}`;
+      } else {
+        netSubEl.textContent = `↑${fmtBytes(todayBucket.out || 0)} ↓${fmtBytes(todayBucket.in || 0)}`;
+      }
+      $('metric-net-box').title = [
+        '仅统计本机 Antigravity（AGY）自身进程与远端服务器通信流量（不含其他软件与本地回环）',
+        `AGY 今日累计：${fmtBytes(todayTotal)}（上传 ${fmtBytes(todayBucket.out || 0)} / 下载 ${fmtBytes(todayBucket.in || 0)}）`,
+        `AGY 历史累计：${fmtBytes(allTotal)}（上传 ${fmtBytes(net.allTime?.out || 0)} / 下载 ${fmtBytes(net.allTime?.in || 0)}）`,
+        `AGY 当前活跃连接：${net.liveExternal?.count || 0} 条（${fmtBytes(net.liveExternal?.total || 0)}）`,
+        `已剔除本地 IPC 回环：当前 ${fmtBytes(net.liveLoopback?.total || 0)} / 今日 ${fmtBytes(net.todayLoopback?.total || 0)}`,
+        '点击查看完整流量统计页签',
+      ].join('\n');
+    } else {
+      netValEl.textContent = '—';
+      netValEl.classList.remove('is-live-speed');
+      netSubEl.textContent = '仅 macOS';
+      $('metric-net-box').title = net?.reason || '点击查看词元流量与接口统计';
+    }
+
+    const grandTotalTok = tok.grandTotalTokens || tok.total || 0;
+    $('metric-total-tok').textContent = fmtTokens(grandTotalTok);
+    const latestTtft = sm?.latency?.latestTtftMs ?? null;
+    const avgTtft = sm?.latency?.avgTtftMs ?? null;
+    const curQuota = quota?.currentModelQuota || null;
+    if (latestTtft != null) {
+      $('metric-total-sub').textContent = `首字 ${fmtMsShort(latestTtft)}`;
+    } else if (curQuota) {
+      $('metric-total-sub').textContent = `配额 ${curQuota.remainingPercent.toFixed(0)}%`;
+    } else {
+      $('metric-total-sub').textContent = sm?.apiCalls ? `${sm.apiCalls} 次调用` : '点击看明细';
+    }
+    $('metric-total-box').title = [
+      `本会话累计词元（含子代理）：${grandTotalTok.toLocaleString()} t`,
+      sm?.apiCalls ? `API 调用：${sm.apiCalls} 次${sm.subagentApiCalls ? `（含子代理 +${sm.subagentApiCalls}）` : ''}` : '',
+      latestTtft != null ? `首字延迟 TTFT：最新 ${fmtMsShort(latestTtft)}${avgTtft != null ? ` / 均值 ${fmtMsShort(avgTtft)}` : ''}` : '',
+      sm?.quality?.retries ? `接口重试：${sm.quality.retries} 次` : '',
+      curQuota ? `当前模型配额剩余：${curQuota.remainingPercent.toFixed(1)}%` : '',
+      '点击查看完整流量与接口指标',
     ].filter(Boolean).join('\n');
 
     // 检查手动触发的压缩是否已完成，或已被用户撤回 / 手动停止
@@ -488,10 +637,349 @@
     // 5. 三级背景：其他会话任务（排除当前正在查看的会话，活跃优先，已结束折叠）
     renderOtherSessions(gl.sessions || [], cur.conversationId);
 
-    // 6. 执行轨迹页签
+    // 6. 流量与接口指标页签
+    renderTrafficView(snap);
+
+    // 7. 执行轨迹页签
     renderTimeline(cur.rounds || [], cur.totalRounds || 0);
 
     tickLiveClocks();
+  }
+
+  const BREAKDOWN_COLORS = ['#38bdf8', '#10b981', '#a855f7', '#f59e0b', '#f97316', '#64748b'];
+
+  function renderTrafficView(snap) {
+    const cur = snap.current || {};
+    const sm = cur.metrics || null;
+    const tok = cur.tokens || {};
+    const net = snap.network || null;
+    const gu = snap.globalUsage || null;
+    const quota = snap.quota || null;
+    const nowMs = Date.now() + state.serverClockSkewMs;
+
+    // 1. AGY 服务端通信流量卡片（仅统计本机 Antigravity 自身进程与远端服务器通信）
+    if (net?.available) {
+      $('net-body').classList.remove('hidden');
+      $('net-unavailable').classList.add('hidden');
+      $('btn-reset-net').classList.remove('hidden');
+
+      const ratePill = $('net-rate-pill');
+      const totalBps = net.rates?.totalBps || 0;
+      if (totalBps >= 256) {
+        ratePill.textContent = `↑${fmtByteRate(net.rates.outBps)} · ↓${fmtByteRate(net.rates.inBps)}`;
+        ratePill.classList.add('is-active');
+      } else {
+        ratePill.textContent = '静默 0 B/s';
+        ratePill.classList.remove('is-active');
+      }
+
+      let bucket = net.today || { in: 0, out: 0, total: 0 };
+      let scopeHint = `AGY 今日通信累计（${net.todayDate || ''}）`;
+      let procs = Array.isArray(net.todayByProcess) ? net.todayByProcess : [];
+      let isLiveScope = false;
+      if (state.netScope === 'all') {
+        bucket = net.allTime || { in: 0, out: 0, total: 0 };
+        const sinceStr = fmtDateTimeShort(net.trackingSinceMs);
+        scopeHint = sinceStr ? `自 ${sinceStr} 起 AGY 通信累计` : 'AGY 历史通信累计';
+        procs = Array.isArray(net.allTimeByProcess) ? net.allTimeByProcess : [];
+      } else if (state.netScope === 'live') {
+        bucket = net.liveExternal || { in: 0, out: 0, total: 0 };
+        scopeHint = `AGY 当前活跃服务端连接（${net.liveExternal?.count || 0} 条）`;
+        procs = Array.isArray(net.byProcess) ? net.byProcess : [];
+        isLiveScope = true;
+      }
+
+      const tot = bucket.total || 0;
+      const txPct = tot > 0 ? Math.round(((bucket.out || 0) / tot) * 1000) / 10 : 0;
+      const rxPct = tot > 0 ? Math.max(0, Math.round((100 - txPct) * 10) / 10) : 0;
+      $('net-total-val').textContent = fmtBytes(tot);
+      $('net-scope-hint').textContent = scopeHint;
+      $('net-tx-val').textContent = `${fmtBytes(bucket.out || 0)}${tot > 0 ? ` (${txPct}%)` : ''}`;
+      $('net-rx-val').textContent = `${fmtBytes(bucket.in || 0)}${tot > 0 ? ` (${rxPct}%)` : ''}`;
+      $('net-bar-tx').style.width = `${txPct}%`;
+      $('net-bar-rx').style.width = `${rxPct}%`;
+
+      if (procs.length > 0) {
+        $('net-proc-list').classList.remove('hidden');
+        $('net-proc-list').innerHTML = procs.map((p) => {
+          const metaSuffix = isLiveScope && p.pid
+            ? ` <span class="metric-sub">#${esc(p.pid)} · ${esc(p.sockets)}连接</span>`
+            : '';
+          const rowTitle = isLiveScope && p.pid
+            ? `PID ${p.pid} · ${p.sockets} 条 AGY 活跃远端连接`
+            : `${p.name} · 上传 ${fmtBytes(p.out)} / 下载 ${fmtBytes(p.in)}`;
+          return `
+            <div class="kv-row">
+              <span class="kv-key" title="${esc(rowTitle)}">${esc(p.name)}${metaSuffix}</span>
+              <span class="kv-val tabular">↑${esc(fmtBytes(p.out))} · ↓${esc(fmtBytes(p.in))}</span>
+            </div>
+          `;
+        }).join('');
+      } else {
+        $('net-proc-list').classList.add('hidden');
+        $('net-proc-list').innerHTML = '';
+      }
+
+      const notes = ['仅计本机 AGY 进程与远端服务器通信（不含其他应用）'];
+      if (net.liveExternal?.proxyCount > 0) {
+        notes.push(`含 ${net.liveExternal.proxyCount} 条经本地代理连接`);
+      }
+      if (state.netScope === 'all') {
+        notes.push(`已剔除本地 IPC 回环：累计 ${fmtBytes(net.allTimeLoopback?.total ?? net.todayLoopback?.total ?? 0)} / 活跃 ${fmtBytes(net.liveLoopback?.total || 0)}`);
+      } else if (state.netScope === 'live') {
+        notes.push(`已剔除本地 IPC 回环：当前活跃 ${fmtBytes(net.liveLoopback?.total || 0)}`);
+      } else {
+        notes.push(`已剔除本地 IPC 回环：今日 ${fmtBytes(net.todayLoopback?.total || 0)} / 活跃 ${fmtBytes(net.liveLoopback?.total || 0)}`);
+      }
+      $('net-footnote').textContent = notes.join(' · ');
+    } else {
+      $('net-body').classList.add('hidden');
+      $('net-unavailable').classList.remove('hidden');
+      $('net-unavailable').textContent = net?.reason || '当前系统不支持原生 AGY 进程网络流量抓测，下方词元与接口指标仍正常统计。';
+      $('btn-reset-net').classList.add('hidden');
+      $('net-rate-pill').textContent = '不可用';
+      $('net-rate-pill').classList.remove('is-active');
+    }
+
+    // 2. 当前会话缓存命中率与接口指标
+    const modelLabel = sm?.quality?.modelDisplayName || cur.health?.modelName || '';
+    if (modelLabel) {
+      $('sm-model-tag').textContent = modelLabel;
+      $('sm-model-tag').title = sm?.quality?.responseModel ? `${modelLabel} (${sm.quality.responseModel})` : modelLabel;
+      $('sm-model-tag').classList.remove('hidden');
+    } else {
+      $('sm-model-tag').classList.add('hidden');
+    }
+
+    const totalCalls = (sm?.apiCalls || 0) + (sm?.subagentApiCalls || 0);
+    $('sm-calls-meta').textContent = sm?.subagentApiCalls
+      ? `${sm.apiCalls} 次 (+${sm.subagentApiCalls} 子代理)`
+      : `${totalCalls} 次调用`;
+
+    // 统一口径：有子代理时整卡（总词元、缓存命中读取、新输入、总输出与命中率）均包含子代理，tooltip 中单独标出主会话值
+    const hitRate = sm?.cache?.grandHitRate ?? sm?.cache?.hitRate ?? tok.grandCacheHitRate ?? tok.cacheHitRate ?? null;
+    const latestHit = sm?.cache?.latestHitRate ?? tok.latestCacheHitRate ?? null;
+    const savedCacheTok = sm?.cache?.savedTokens ?? ((tok.cache || 0) + (tok.subagentCache || 0));
+    const smCacheEl = $('sm-cache-rate');
+    smCacheEl.className = `cache-big-val tabular ${cacheToneClass(hitRate)}`;
+    smCacheEl.textContent = hitRate != null ? `${hitRate.toFixed(1)}%` : '—';
+    smCacheEl.title = (sm?.tokens?.subagentTotalTokens > 0 && sm?.cache?.hitRate != null)
+      ? `含子代理综合命中率 ${hitRate?.toFixed(1)}%（主会话单独 ${sm.cache.hitRate.toFixed(1)}%）`
+      : '';
+    $('sm-cache-latest').textContent = latestHit != null ? `最新轮 ${latestHit.toFixed(1)}%` : '最新轮 —';
+    $('sm-cache-saved').textContent = `缓存命中 ${fmtTokens(savedCacheTok)}`;
+    $('sm-cache-bar').style.width = `${hitRate != null ? Math.min(100, Math.max(0, hitRate)) : 0}%`;
+
+    const grandTot = tok.grandTotalTokens || tok.total || 0;
+    const subTot = sm?.tokens?.subagentTotalTokens || 0;
+    $('sm-tok-total').textContent = fmtTokens(grandTot);
+    $('sm-tok-sub-total').textContent = subTot > 0 ? `含子代理 ${fmtTokens(subTot)}` : '主会话累计';
+
+    $('sm-tok-cache').textContent = fmtTokens(savedCacheTok);
+    const cwTok = sm?.cache?.cacheWriteTokens || tok.cacheWrite || 0;
+    $('sm-tok-cw').textContent = cwTok > 0 ? `缓存写入 ${fmtTokens(cwTok)}` : '免重复计费';
+
+    $('sm-tok-in').textContent = fmtTokens((tok.input || 0) + (tok.subagentInput || 0));
+    const promptBytes = sm?.tokens?.latestPromptBytes || tok.latestPromptBytes || 0;
+    $('sm-tok-prompt-bytes').textContent = promptBytes > 0 ? `单次载荷 ${fmtBytes(promptBytes)}` : '新鲜 Prompt';
+
+    const grandOut = tok.grandTotalOutput || tok.output || 0;
+    $('sm-tok-out').textContent = fmtTokens(grandOut);
+    if (sm?.tokens?.hasThinkingBreakdown) {
+      const thinkTotal = (sm.tokens.thinkingOutput || 0) + (sm.tokens.subagentThinkingOutput || 0);
+      const respTotal = (sm.tokens.responseOutput || 0) + (sm.tokens.subagentResponseOutput || 0);
+      const thinkPct = grandOut > 0 ? Math.round((thinkTotal / grandOut) * 100) : 0;
+      $('sm-tok-out-split').textContent = `思 ${fmtTokens(thinkTotal)} · 正 ${fmtTokens(respTotal)}`;
+      $('sm-tok-out-split').title = `思考输出 ${thinkTotal.toLocaleString()} t (${thinkPct}%) · 正文输出 ${respTotal.toLocaleString()} t`;
+    } else if (tok.subagentOutput > 0) {
+      $('sm-tok-out-split').textContent = `含子代理 ${fmtTokens(tok.subagentOutput)}`;
+      $('sm-tok-out-split').title = '';
+    } else {
+      $('sm-tok-out-split').textContent = '模型总输出';
+      $('sm-tok-out-split').title = '';
+    }
+
+    const lat = sm?.latency || {};
+    const qual = sm?.quality || {};
+    const hasApiDetail = lat.latestTtftMs != null || lat.avgTtftMs != null || lat.avgDecodeTps != null || tok.maxContextTokens > 0 || qual.retries > 0 || qual.modelCost > 0 || qual.creditCost > 0;
+    if (hasApiDetail) {
+      $('sm-api-grid').classList.remove('hidden');
+      $('sm-ttft-val').textContent = lat.latestTtftMs != null ? fmtMsShort(lat.latestTtftMs) : fmtMsShort(lat.avgTtftMs);
+      $('sm-ttft-sub').textContent = lat.avgTtftMs != null
+        ? `均 ${fmtMsShort(lat.avgTtftMs)}${lat.maxTtftMs != null ? ` · 峰 ${fmtMsShort(lat.maxTtftMs)}` : ''}`
+        : '首字响应延迟';
+
+      const dispDecode = lat.latestDecodeTps ?? lat.avgDecodeTps;
+      $('sm-decode-val').textContent = dispDecode != null ? `${dispDecode.toFixed(1)} t/s` : '—';
+      $('sm-decode-sub').textContent = lat.avgDecodeTps != null && lat.latestDecodeTps != null
+        ? `均 ${lat.avgDecodeTps.toFixed(1)} · ${fmtMsShort(lat.avgStreamMs)}`
+        : (lat.avgStreamMs != null ? `流式均值 ${fmtMsShort(lat.avgStreamMs)}` : '流式解码速度');
+
+      if (tok.maxContextTokens > 0) {
+        $('sm-ctx-pct').textContent = tok.contextUsagePercent != null ? `${tok.contextUsagePercent.toFixed(1)}%` : '0%';
+        $('sm-ctx-sub').textContent = `${fmtTokens(tok.currentContext || 0)} / ${fmtTokens(tok.maxContextTokens)}`;
+      } else {
+        $('sm-ctx-pct').textContent = fmtTokens(tok.currentContext || 0);
+        $('sm-ctx-sub').textContent = '当前活跃上下文';
+      }
+
+      const retriesCount = qual.retries || 0;
+      $('sm-retries-val').textContent = `${retriesCount} 次重试`;
+      const costParts = [];
+      if (qual.modelCost > 0) costParts.push(`$${qual.modelCost.toFixed(4)}`);
+      if (qual.creditCost > 0) costParts.push(`${qual.creditCost} 积分`);
+      $('sm-retries-sub').textContent = costParts.length
+        ? costParts.join(' · ')
+        : (retriesCount > 0 ? '含自动退避重连' : '请求全部一次成功');
+    } else {
+      $('sm-api-grid').classList.add('hidden');
+    }
+
+    const bd = sm?.contextBreakdown;
+    if (bd && Array.isArray(bd.items) && bd.items.length > 0) {
+      $('sm-breakdown-wrap').classList.remove('hidden');
+      $('sm-breakdown-total').textContent = `合计 ${fmtTokens(bd.totalTokens)}`;
+      $('sm-breakdown-bar').innerHTML = bd.items.map((it, idx) => `
+        <div class="stacked-seg" style="width:${Math.max(1, it.percent)}%;background:${BREAKDOWN_COLORS[idx % BREAKDOWN_COLORS.length]}" title="${esc(it.label)}：${it.tokens.toLocaleString()} t (${it.percent}%)"></div>
+      `).join('');
+      $('sm-breakdown-legend').innerHTML = bd.items.map((it, idx) => `
+        <span class="legend-item tabular" title="${it.tokens.toLocaleString()} t">
+          <span class="legend-dot" style="background:${BREAKDOWN_COLORS[idx % BREAKDOWN_COLORS.length]}"></span>
+          ${esc(it.label)} ${esc(fmtTokens(it.tokens))} (${it.percent}%)
+        </span>
+      `).join('');
+    } else {
+      $('sm-breakdown-wrap').classList.add('hidden');
+    }
+
+    // 3. 全机已统计会话累计
+    if (gu?.available) {
+      $('global-usage-section').classList.remove('hidden');
+      const isTodayScope = state.guScope === 'today';
+      const gBucket = isTodayScope ? gu.today : gu.allTime;
+      $('gu-scan-meta').textContent = gu.scanning
+        ? `扫描中 ${gu.scannedCount}/${gu.totalDbCount}`
+        : `${gBucket?.conversationCount || 0} 个会话`;
+
+      $('gu-tok-total').textContent = fmtTokens(gBucket?.totalTokens || 0);
+      const guCostParts = [];
+      if (gBucket?.modelCost > 0) guCostParts.push(`$${gBucket.modelCost.toFixed(4)}`);
+      if (gBucket?.creditCost > 0) guCostParts.push(`${gBucket.creditCost} 积分`);
+      $('gu-calls-sub').textContent = guCostParts.length
+        ? `${(gBucket?.apiCalls || 0).toLocaleString()} 次 · ${guCostParts.join(' / ')}`
+        : `${(gBucket?.apiCalls || 0).toLocaleString()} 次接口调用`;
+      const guPerfParts = [];
+      if (gBucket?.avgTtftMs != null) {
+        guPerfParts.push(`全局首字延迟 TTFT：均值 ${fmtMsShort(gBucket.avgTtftMs)}${gBucket.maxTtftMs != null ? ` / 峰值 ${fmtMsShort(gBucket.maxTtftMs)}` : ''}`);
+      }
+      if (gBucket?.decodeTps != null) {
+        guPerfParts.push(`全局流式解码均速：${gBucket.decodeTps.toFixed(1)} t/s${gBucket.avgStreamMs != null ? `（均值耗时 ${fmtMsShort(gBucket.avgStreamMs)}）` : ''}`);
+      }
+      if (gBucket?.modelCost > 0) guPerfParts.push(`累计模型费用：$${gBucket.modelCost.toFixed(4)}`);
+      if (gBucket?.creditCost > 0) guPerfParts.push(`累计积分消耗：${gBucket.creditCost}`);
+      $('gu-tok-total').parentElement.title = [
+        `${isTodayScope ? '今日' : '全部'}累计总词元：${(gBucket?.totalTokens || 0).toLocaleString()} t`,
+        ...guPerfParts,
+      ].join('\n');
+
+      const gRate = gBucket?.cacheHitRate ?? null;
+      const gRateEl = $('gu-cache-rate');
+      gRateEl.className = `stat-val tabular ${cacheToneClass(gRate)}`;
+      gRateEl.textContent = gRate != null ? `${gRate.toFixed(1)}%` : '—';
+      $('gu-cache-read').textContent = `命中 ${fmtTokens(gBucket?.cacheRead || 0)}`;
+
+      $('gu-tok-in').textContent = fmtTokens(gBucket?.input || 0);
+      const cwGlobal = gBucket?.cacheWrite || 0;
+      $('gu-retries').textContent = cwGlobal > 0
+        ? `写入 ${fmtTokens(cwGlobal)} · 重试 ${gBucket?.retries || 0}`
+        : `累计重试 ${gBucket?.retries || 0} 次`;
+
+      $('gu-tok-out').textContent = fmtTokens(gBucket?.output || 0);
+      if (gBucket?.hasThinkingBreakdown) {
+        $('gu-out-split').textContent = `思 ${fmtTokens(gBucket.thinkingOutput)} · 正 ${fmtTokens(gBucket.responseOutput)}`;
+      } else if (gBucket?.decodeTps != null) {
+        $('gu-out-split').textContent = `解码 ${gBucket.decodeTps.toFixed(1)} t/s`;
+      } else {
+        $('gu-out-split').textContent = '总生成输出';
+      }
+      $('gu-tok-out').parentElement.title = guPerfParts.join('\n');
+
+      const tops = isTodayScope ? (gu.topSessionsToday || []) : (gu.topSessions || []);
+      $('gu-top-heading').textContent = isTodayScope ? '今日消耗最高会话' : '词元消耗最高会话';
+      if (tops.length > 0) {
+        $('gu-top-wrap').classList.remove('hidden');
+        $('gu-top-list').innerHTML = tops.map((s) => `
+          <div class="flat-row interactive js-pick-session ${s.conversationId === cur.conversationId ? 'is-selected' : ''}" data-conv="${esc(s.conversationId)}">
+            <div class="flat-row-top">
+              <div class="flat-row-left">
+                ${s.workspaceName ? `<span class="flat-row-ws" title="${esc(s.workspaceName)}">${esc(s.workspaceName)}</span>` : ''}
+                <span class="flat-row-title" title="${esc(s.title)}">${s.isSubagent ? '[子代理] ' : ''}${esc(s.title)}</span>
+              </div>
+              <div class="flat-row-right">
+                <span class="row-tps idle tabular">${esc(fmtTokens(s.totalTokens))}</span>
+              </div>
+            </div>
+            <div class="flat-row-sub tabular">${s.cacheHitRate != null ? `缓存 ${s.cacheHitRate.toFixed(1)}% · ` : ''}${s.apiCalls} 次调用 · 输出 ${esc(fmtTokens(s.output))}</div>
+          </div>
+        `).join('');
+      } else {
+        $('gu-top-wrap').classList.add('hidden');
+      }
+    } else {
+      $('global-usage-section').classList.add('hidden');
+    }
+
+    // 4. 账号与模型配额（接口有返回时显示）
+    if (quota && ((quota.groups && quota.groups.length > 0) || quota.credits)) {
+      $('quota-section').classList.remove('hidden');
+      if (quota.planName) {
+        $('quota-plan-tag').textContent = quota.planName;
+        $('quota-plan-tag').classList.remove('hidden');
+      } else {
+        $('quota-plan-tag').classList.add('hidden');
+      }
+
+      const cr = quota.credits;
+      const crParts = [];
+      const crTips = [];
+      if (cr?.availablePrompt != null) {
+        crParts.push(`Prompt ${cr.availablePrompt.toLocaleString()}`);
+        crTips.push(`Prompt 剩余 ${cr.availablePrompt.toLocaleString()}${cr.monthlyPrompt != null ? ` / 月额 ${cr.monthlyPrompt.toLocaleString()}` : ''}${cr.usedPrompt != null ? `（已用 ${cr.usedPrompt.toLocaleString()}）` : ''}`);
+      }
+      if (cr?.availableFlow != null) {
+        crParts.push(`Flow ${cr.availableFlow.toLocaleString()}`);
+        crTips.push(`Flow 剩余 ${cr.availableFlow.toLocaleString()}${cr.monthlyFlow != null ? ` / 月额 ${cr.monthlyFlow.toLocaleString()}` : ''}${cr.usedFlow != null ? `（已用 ${cr.usedFlow.toLocaleString()}）` : ''}`);
+      }
+      if (cr?.availableFlex != null) {
+        crParts.push(`Flex ${cr.availableFlex.toLocaleString()}`);
+        crTips.push(`Flex 弹性额度剩余 ${cr.availableFlex.toLocaleString()}`);
+      }
+      $('quota-credits-meta').textContent = crParts.length ? `额度 ${crParts.join(' / ')}` : '';
+      $('quota-credits-meta').title = crTips.join('\n');
+
+      $('quota-list').innerHTML = (quota.groups || []).map((g) => {
+        const pct = Math.min(100, Math.max(0, g.remainingPercent || 0));
+        const exhausted = pct <= 0;
+        const fillCls = pct <= 15 ? 'quota-fill-low' : (pct <= 40 ? 'quota-fill-warn' : 'quota-fill-ok');
+        const resetStr = g.resetAtMs ? fmtResetCountdown(g.resetAtMs, nowMs) : '';
+        const metaText = exhausted
+          ? `已耗尽${resetStr ? ` · ${resetStr}` : ''}`
+          : `${pct.toFixed(1)}%${resetStr ? ` · ${resetStr}` : ''}`;
+        return `
+          <div class="quota-row">
+            <div class="quota-row-head">
+              <span class="quota-label" title="${esc(g.label)}（${g.modelsCount} 个模型共享）">${esc(g.label)}</span>
+              <span class="quota-meta tabular ${exhausted ? 'is-exhausted' : ''}">${esc(metaText)}</span>
+            </div>
+            <div class="progress-track">
+              <div class="${fillCls}" style="width:${pct}%"></div>
+            </div>
+          </div>
+        `;
+      }).join('');
+    } else {
+      $('quota-section').classList.add('hidden');
+    }
   }
 
   function buildFlatSessionRow(s) {
@@ -599,6 +1087,15 @@
         `;
       }
       if (r.kind === 'compact') {
+        const cpTok = r.tokens;
+        const cpMeta = cpTok
+          ? [
+            cpTok.cacheHitRate != null ? `缓存 ${cpTok.cacheHitRate.toFixed(0)}%` : '',
+            `入 ${fmtTokens(cpTok.in)}`,
+            cpTok.cache > 0 ? `缓 ${fmtTokens(cpTok.cache)}` : '',
+            `出 ${fmtTokens(cpTok.out)}`,
+          ].filter(Boolean).join(' · ')
+          : '';
         return `
           <article class="tl-card is-compact">
             <div class="tl-head">
@@ -606,14 +1103,37 @@
               <span class="tabular">${esc(fmtTimeOfDay(r.startedAtMs))}</span>
             </div>
             <div class="tl-title">${esc(r.title)}</div>
+            ${cpMeta ? `<div class="tl-metrics tabular">${esc(cpMeta)}</div>` : ''}
           </article>
         `;
       }
 
+      const am = r.apiMetrics || null;
       const tpsStr = r.tps != null ? `${r.tps.toFixed(1)} t/s` : '';
       const thinkStr = r.thinkingMs != null ? `思考 ${fmtShortDur(r.thinkingMs / 1000)}` : '';
       const toolsStr = r.toolsMs != null ? `工具 ${fmtShortDur(r.toolsMs / 1000)}` : '';
       const durMeta = [tpsStr, thinkStr, toolsStr].filter(Boolean).join(' · ') || fmtTimeOfDay(r.startedAtMs);
+
+      const roundHitRate = am?.cacheHitRate ?? r.tokens?.cacheHitRate ?? null;
+      const metricParts = [];
+      if (roundHitRate != null) metricParts.push(`缓存 ${roundHitRate.toFixed(0)}%`);
+      if (am?.ttftMs != null) metricParts.push(`首字 ${fmtMsShort(am.ttftMs)}`);
+      if (am?.decodeTps != null) metricParts.push(`解码 ${am.decodeTps.toFixed(1)} t/s`);
+      const effIn = am?.input ?? r.tokens?.in ?? 0;
+      const effCache = am?.cacheRead ?? r.tokens?.cache ?? 0;
+      const effOut = am?.output ?? r.tokens?.out ?? 0;
+      const effCw = am?.cacheWrite ?? 0;
+      if (effIn > 0 || effCache > 0 || effOut > 0 || effCw > 0) {
+        const outDetail = am?.thinkingOutput > 0
+          ? `${fmtTokens(effOut)}(思${fmtTokens(am.thinkingOutput)})`
+          : fmtTokens(effOut);
+        const cwPart = effCw > 0 ? ` / 写 ${fmtTokens(effCw)}` : '';
+        metricParts.push(`入 ${fmtTokens(effIn)} / 缓 ${fmtTokens(effCache)}${cwPart} / 出 ${outDetail}`);
+      }
+      if (am?.retries > 0) metricParts.push(`重试 ${am.retries}`);
+      const roundMetricsHtml = metricParts.length
+        ? `<div class="tl-metrics tabular">${esc(metricParts.join(' · '))}</div>`
+        : '';
 
       const toolsHtml = (r.tools || []).map((t) => {
         const icon = t.status === 'ERROR'
@@ -646,6 +1166,7 @@
             <span class="tabular">${esc(durMeta)}</span>
           </div>
           <div class="tl-title">${esc(r.title)}</div>
+          ${roundMetricsHtml}
           ${toolsHtml ? `<div class="tl-tools">${toolsHtml}</div>` : ''}
         </article>
       `;
@@ -683,7 +1204,9 @@
 
   // ---------- 轮询循环 ----------
   let pollTimer = null;
+  let pollSeq = 0;
   async function pollOnce() {
+    const mySeq = ++pollSeq;
     const currentHostConv = hostConvId();
     if (currentHostConv !== state.lastHostConvId) {
       state.lastHostConvId = currentHostConv;
@@ -703,6 +1226,7 @@
       if (state.etag) qs.set('etag', state.etag);
 
       const data = await apiGet(`/api/state?${qs.toString()}`);
+      if (mySeq !== pollSeq) return;
       if (data.uiBuildKey) {
         if (state.uiBuildKey && state.uiBuildKey !== data.uiBuildKey) {
           window.location.reload();
@@ -738,10 +1262,12 @@
     } catch {
       // 瞬态网络或服务重载静默恢复
     } finally {
-      const curState = state.snap?.current?.health?.state || 'IDLE';
-      const nextDelay = LIVE_STATES.has(curState) ? ACTIVE_POLL_MS : IDLE_POLL_MS;
-      clearTimeout(pollTimer);
-      pollTimer = setTimeout(pollOnce, nextDelay);
+      if (mySeq === pollSeq) {
+        const curState = state.snap?.current?.health?.state || 'IDLE';
+        const nextDelay = LIVE_STATES.has(curState) ? ACTIVE_POLL_MS : IDLE_POLL_MS;
+        clearTimeout(pollTimer);
+        pollTimer = setTimeout(pollOnce, nextDelay);
+      }
     }
   }
 
@@ -754,17 +1280,91 @@
   }
 
   // ---------- 交互事件绑定 ----------
-  document.querySelectorAll('.seg-tab').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      state.tab = btn.dataset.tab;
-      document.querySelectorAll('.seg-tab').forEach((b) => {
-        const active = b.dataset.tab === state.tab;
-        b.classList.toggle('active', active);
-        b.setAttribute('aria-selected', String(active));
-      });
-      $('view-overview').classList.toggle('active', state.tab === 'overview');
-      $('view-timeline').classList.toggle('active', state.tab === 'timeline');
+  function switchTab(nextTab) {
+    state.tab = nextTab;
+    document.querySelectorAll('.seg-tab').forEach((b) => {
+      const active = b.dataset.tab === state.tab;
+      b.classList.toggle('active', active);
+      b.setAttribute('aria-selected', String(active));
     });
+    $('view-overview').classList.toggle('active', state.tab === 'overview');
+    $('view-traffic').classList.toggle('active', state.tab === 'traffic');
+    $('view-timeline').classList.toggle('active', state.tab === 'timeline');
+  }
+
+  document.querySelectorAll('.seg-tab').forEach((btn) => {
+    btn.addEventListener('click', () => switchTab(btn.dataset.tab));
+  });
+
+  document.querySelectorAll('.js-open-traffic').forEach((btn) => {
+    btn.addEventListener('click', () => switchTab('traffic'));
+  });
+
+  document.querySelectorAll('[data-net-scope]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.netScope = btn.dataset.netScope;
+      document.querySelectorAll('[data-net-scope]').forEach((b) => {
+        b.classList.toggle('active', b === btn);
+      });
+      if (state.snap) renderTrafficView(state.snap);
+    });
+  });
+
+  document.querySelectorAll('[data-gu-scope]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.guScope = btn.dataset.guScope;
+      document.querySelectorAll('[data-gu-scope]').forEach((b) => {
+        b.classList.toggle('active', b === btn);
+      });
+      if (state.snap) renderTrafficView(state.snap);
+    });
+  });
+
+  let resetNetConfirmTimer = null;
+  let resetNetArmed = false;
+  const disarmResetNet = () => {
+    resetNetArmed = false;
+    clearTimeout(resetNetConfirmTimer);
+    resetNetConfirmTimer = null;
+    const btn = $('btn-reset-net');
+    if (btn) {
+      btn.textContent = '清零';
+      btn.classList.remove('is-confirm');
+    }
+  };
+
+  $('btn-reset-net').addEventListener('click', async () => {
+    const btn = $('btn-reset-net');
+    if (btn.disabled) return;
+    if (!resetNetArmed) {
+      resetNetArmed = true;
+      btn.textContent = '确认清零?';
+      btn.classList.add('is-confirm');
+      clearTimeout(resetNetConfirmTimer);
+      resetNetConfirmTimer = setTimeout(disarmResetNet, 3500);
+      return;
+    }
+    disarmResetNet();
+    btn.disabled = true;
+    // 递增 pollSeq，防止清零期间在途的旧轮询快照回写旧流量
+    pollSeq += 1;
+    try {
+      const res = await apiPost('/api/traffic/reset', {});
+      if (res?.ok && state.snap) {
+        state.snap.network = res.network;
+        state.etag = '';
+        renderAll();
+        showToast('已清零 AGY 服务端流量累计');
+      } else {
+        showToast('重置失败');
+      }
+    } catch {
+      showToast('重置失败');
+    } finally {
+      btn.disabled = false;
+      clearTimeout(pollTimer);
+      pollTimer = setTimeout(pollOnce, IDLE_POLL_MS);
+    }
   });
 
   document.querySelectorAll('.chip').forEach((chip) => {
@@ -820,6 +1420,7 @@
 
   $('parallel-active-list').addEventListener('click', handleSessionRowClick);
   $('parallel-idle-list').addEventListener('click', handleSessionRowClick);
+  $('gu-top-list').addEventListener('click', handleSessionRowClick);
 
   $('sub-list').addEventListener('click', (e) => {
     const jumpBtn = e.target.closest('.js-jump-conv');
@@ -982,6 +1583,13 @@
     const h = cur?.health;
     if (!cur || !h) return;
     const sp = cur.tokenSpeed || {};
+    const tok = cur.tokens || {};
+    const sm = cur.metrics || null;
+    const net = state.snap?.network || null;
+    const gu = state.snap?.globalUsage || null;
+    const quota = state.snap?.quota || null;
+    const hitRate = sm?.cache?.grandHitRate ?? sm?.cache?.hitRate ?? tok.grandCacheHitRate ?? tok.cacheHitRate ?? null;
+    const promptBytes = sm?.tokens?.latestPromptBytes || tok.latestPromptBytes || 0;
     const lines = [
       `### Antigravity 会话监控 · 诊断快照`,
       `- **会话编号**：\`${cur.conversationId || '未关联'}\``,
@@ -990,9 +1598,25 @@
       `- **当前动作**：${h.headline}`,
       h.detail ? `- **补充详情**：${h.detail}` : '',
       sp.latestTps != null
-        ? `- **生成速度**：最新 ${sp.latestTps.toFixed(1)} t/s（均值 ${(sp.avgTps ?? sp.latestTps).toFixed(1)} t/s · 峰值 ${(sp.peakTps ?? sp.latestTps).toFixed(1)} t/s）`
+        ? `- **生成速度**：最新 ${sp.latestTps.toFixed(1)} t/s（均值 ${(sp.avgTps ?? sp.latestTps).toFixed(1)} t/s · 峰值 ${(sp.peakTps ?? sp.latestTps).toFixed(1)} t/s${sp.decodeTps != null ? ` · 流式解码 ${sp.decodeTps.toFixed(1)} t/s` : ''}）`
         : '',
       `- **本轮耗时**：${$('metric-dur').textContent}（累计 ${cur.stepCount || 0} 步）`,
+      `- **上下文与词元**：当前 ${(tok.currentContext || 0).toLocaleString()} t${tok.maxContextTokens ? ` / ${tok.maxContextTokens.toLocaleString()} t (${tok.contextUsagePercent ?? 0}%)` : ''}${promptBytes > 0 ? ` · 单次载荷 ${fmtBytes(promptBytes)}` : ''} · 累计总词元 ${(tok.grandTotalTokens || tok.total || 0).toLocaleString()} t（输入 ${((tok.input || 0) + (tok.subagentInput || 0)).toLocaleString()} / 缓存 ${(sm?.cache?.savedTokens ?? tok.cache ?? 0).toLocaleString()}${(sm?.cache?.cacheWriteTokens || tok.cacheWrite) ? ` / 写入 ${(sm?.cache?.cacheWriteTokens || tok.cacheWrite).toLocaleString()}` : ''} / 输出 ${(tok.grandTotalOutput || tok.output || 0).toLocaleString()}）`,
+      hitRate != null
+        ? `- **缓存命中率**：累计 ${hitRate.toFixed(1)}%${sm?.cache?.latestHitRate != null ? ` · 最新轮 ${sm.cache.latestHitRate.toFixed(1)}%` : ''}`
+        : '',
+      sm?.latency?.avgTtftMs != null
+        ? `- **接口延迟与质量**：TTFT 均值 ${fmtMsShort(sm.latency.avgTtftMs)}（最新 ${fmtMsShort(sm.latency.latestTtftMs)}）· 调用 ${(sm.apiCalls || 0) + (sm.subagentApiCalls || 0)} 次 · 重试 ${sm.quality?.retries || 0} 次`
+        : '',
+      net?.available
+        ? `- **AGY 服务端流量**：今日 ${fmtBytes(net.today?.total || 0)}（↑${fmtBytes(net.today?.out || 0)} / ↓${fmtBytes(net.today?.in || 0)}）· 历史累计 ${fmtBytes(net.allTime?.total || 0)}（↑${fmtBytes(net.allTime?.out || 0)} / ↓${fmtBytes(net.allTime?.in || 0)}）`
+        : '',
+      gu?.allTime?.totalTokens
+        ? `- **全机累计词元**：累计 ${fmtTokens(gu.allTime.totalTokens)}（${gu.allTime.conversationCount} 会话 · 缓存 ${gu.allTime.cacheHitRate != null ? `${gu.allTime.cacheHitRate.toFixed(1)}%` : '—'}）${gu.today?.totalTokens ? ` · 今日 ${fmtTokens(gu.today.totalTokens)}（${gu.today.conversationCount} 会话）` : ''}`
+        : '',
+      quota?.currentModelQuota
+        ? `- **当前模型配额**：${quota.currentModelQuota.label} 剩余 ${quota.currentModelQuota.remainingPercent.toFixed(1)}%`
+        : '',
       h.process ? `- **活跃子进程**：PID ${h.process.pid} · CPU ${h.process.cpu}% · \`${h.process.command}\`` : '',
       cur.milestones ? `- **阶段进度**：${cur.milestones.done}/${cur.milestones.total}（${cur.milestones.percent}%）` : '',
       cur.compactHint?.needed ? `- **上下文建议**：${cur.compactHint.message}` : '',

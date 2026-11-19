@@ -1081,4 +1081,66 @@ test('parseTranscript separates turnLatestTps from historical latestTps and scop
   assert.equal(hTurn2.state, 'THINKING');
 });
 
+test('parseTranscript computes cumulative and latest cacheHitRate, extracts modelId, and tracks checkpointTokens', () => {
+  const lines = [
+    JSON.stringify({
+      step_index: 0,
+      type: 'USER_INPUT',
+      created_at: '2026-11-19T10:00:00Z',
+      content: '<USER_REQUEST>检查缓存命中率</USER_REQUEST>',
+    }),
+    JSON.stringify({
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-19T10:00:05Z',
+      model: 'gemini-4-neon-xhigh',
+      input_tokens: 10000,
+      cache_read_tokens: 0,
+      output_tokens: 300,
+      tool_calls: [{ name: 'read_file', args: { Path: '"/repo/a.js"' } }],
+    }),
+    JSON.stringify({
+      step_index: 2,
+      type: 'GENERIC',
+      status: 'DONE',
+      created_at: '2026-11-19T10:00:06Z',
+      content: 'ok',
+    }),
+    JSON.stringify({
+      step_index: 3,
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-19T10:00:10Z',
+      model: 'gemini-4-neon-xhigh',
+      input_tokens: 1000,
+      cache_read_tokens: 19000,
+      output_tokens: 200,
+      content: 'done',
+    }),
+    JSON.stringify({
+      step_index: 4,
+      source: 'SYSTEM',
+      type: 'CHECKPOINT',
+      created_at: '2026-11-19T10:01:00Z',
+      input_tokens: 500,
+      cache_read_tokens: 19500,
+      output_tokens: 800,
+      content: '# Resuming from a compaction',
+    }),
+  ].join('\n');
+
+  const tr = parseTranscript(lines, Date.parse('2026-11-19T10:01:00Z'));
+  assert.equal(tr.modelId, 'gemini-4-neon-xhigh');
+  assert.equal(tr.tokens.input, 11000);
+  assert.equal(tr.tokens.cache, 19000);
+  assert.equal(tr.tokens.output, 500);
+  assert.equal(tr.tokens.total, 30500);
+  assert.equal(tr.tokens.cacheHitRate, 63.3); // 19000 / 30000
+  assert.equal(tr.tokens.latestCacheHitRate, 95.0); // 19000 / 20000
+  assert.equal(tr.rounds[0].tokens.cacheHitRate, 0);
+  assert.equal(tr.rounds[1].tokens.cacheHitRate, 95.0);
+  assert.deepEqual(tr.checkpointTokens, { input: 500, cache: 19500, output: 800 });
+  assert.equal(tr.rounds[2].tokens.cacheHitRate, 97.5);
+});
+
+
 

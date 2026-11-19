@@ -22,6 +22,9 @@
             <button type="button" role="tab" id="tab-btn-overview" class="seg-tab active" data-tab="overview" aria-selected="true">
               总览
             </button>
+            <button type="button" role="tab" id="tab-btn-traffic" class="seg-tab" data-tab="traffic" aria-selected="false">
+              流量
+            </button>
             <button type="button" role="tab" id="tab-btn-timeline" class="seg-tab" data-tab="timeline" aria-selected="false">
               轨迹 <span id="timeline-count" class="seg-count">0</span>
             </button>
@@ -98,7 +101,7 @@
           <p id="hero-headline" class="hero-action">等待发送任务指令</p>
           <p id="hero-detail" class="hero-subdetail hidden"></p>
 
-          <!-- 三栏核心遥测指标（无多余胶囊边框） -->
+          <!-- 两行六格核心遥测指标（无多余胶囊边框） -->
           <div class="metrics-strip">
             <div id="metric-speed-box" class="metric-cell" title="">
               <span class="metric-label">生成速度</span>
@@ -115,6 +118,24 @@
               <strong id="metric-ctx" class="metric-val tabular">0</strong>
               <span id="metric-out" class="metric-sub tabular">输出 0</span>
             </div>
+          </div>
+
+          <div class="metrics-strip metrics-strip-secondary">
+            <button type="button" id="metric-cache-box" class="metric-cell metric-link js-open-traffic" title="">
+              <span class="metric-label">缓存命中</span>
+              <strong id="metric-cache" class="metric-val tabular">—</strong>
+              <span id="metric-cache-sub" class="metric-sub tabular">暂无数据</span>
+            </button>
+            <button type="button" id="metric-net-box" class="metric-cell metric-link js-open-traffic" title="">
+              <span class="metric-label">AGY 流量</span>
+              <strong id="metric-net" class="metric-val tabular">—</strong>
+              <span id="metric-net-sub" class="metric-sub tabular">监测中</span>
+            </button>
+            <button type="button" id="metric-total-box" class="metric-cell metric-link js-open-traffic" title="">
+              <span class="metric-label">累计词元</span>
+              <strong id="metric-total-tok" class="metric-val tabular">0</strong>
+              <span id="metric-total-sub" class="metric-sub tabular">点击看明细</span>
+            </button>
           </div>
 
           <!-- 异常/阻塞时按需出现的干预栏（正常运行时完全隐藏） -->
@@ -192,7 +213,189 @@
         </section>
       </section>
 
-      <!-- 视图二：执行轨迹 -->
+      <!-- 视图二：流量与接口指标统计 -->
+      <section id="view-traffic" class="tab-panel" role="tabpanel">
+        <!-- 1. AGY 服务端通信流量监控 -->
+        <article id="net-section" class="stat-card">
+          <div class="stat-card-head">
+            <div class="sec-title-group">
+              <span class="sec-title">AGY 服务端流量</span>
+              <span id="net-rate-pill" class="rate-pill tabular">0 B/s</span>
+            </div>
+            <div class="stat-card-actions">
+              <div class="mini-seg" role="group" aria-label="AGY 服务端流量统计范围">
+                <button type="button" class="mini-seg-btn active" data-net-scope="today">今日</button>
+                <button type="button" class="mini-seg-btn" data-net-scope="all">累计</button>
+                <button type="button" class="mini-seg-btn" data-net-scope="live">活跃</button>
+              </div>
+              <button id="btn-reset-net" type="button" class="subtle-btn" title="清零今日与历史 AGY 服务端流量累计（保留当前活跃连接基线）">清零</button>
+            </div>
+          </div>
+
+          <div id="net-body">
+            <div class="net-hero-row">
+              <div class="net-hero-main">
+                <strong id="net-total-val" class="net-big-val tabular">0 B</strong>
+                <span id="net-scope-hint" class="net-scope-hint">AGY 今日服务端通信累计</span>
+              </div>
+              <div class="net-dir-group tabular">
+                <span class="net-dir tx" title="AGY 上传至远端服务器的请求流量">↑ <strong id="net-tx-val">0 B</strong></span>
+                <span class="net-dir rx" title="AGY 从远端服务器下载的响应流量">↓ <strong id="net-rx-val">0 B</strong></span>
+              </div>
+            </div>
+
+            <div class="ratio-bar" title="上行与下行字节占比">
+              <div id="net-bar-tx" class="ratio-fill-tx" style="width: 0%"></div>
+              <div id="net-bar-rx" class="ratio-fill-rx" style="width: 0%"></div>
+            </div>
+
+            <div id="net-proc-list" class="kv-list"></div>
+            <p id="net-footnote" class="stat-footnote"></p>
+          </div>
+          <p id="net-unavailable" class="empty-inline hidden">当前系统不支持原生 AGY 进程网络流量抓测，下方词元与接口指标仍正常统计。</p>
+        </article>
+
+        <!-- 2. 当前会话缓存命中率与接口指标 -->
+        <article id="session-metrics-section" class="stat-card">
+          <div class="stat-card-head">
+            <div class="sec-title-group">
+              <span class="sec-title">当前会话指标</span>
+              <span id="sm-model-tag" class="ws-tag hidden"></span>
+            </div>
+            <span id="sm-calls-meta" class="sec-meta tabular">0 次调用</span>
+          </div>
+
+          <div class="cache-panel">
+            <div class="cache-head">
+              <div class="cache-main">
+                <span class="metric-label">缓存命中率</span>
+                <strong id="sm-cache-rate" class="cache-big-val tabular">—</strong>
+              </div>
+              <div class="cache-side tabular">
+                <span id="sm-cache-latest" class="metric-sub">本轮 —</span>
+                <span id="sm-cache-saved" class="metric-sub">命中读取 0</span>
+              </div>
+            </div>
+            <div class="progress-track">
+              <div id="sm-cache-bar" class="progress-fill-done" style="width: 0%"></div>
+            </div>
+          </div>
+
+          <div class="stat-grid-2">
+            <div class="stat-item">
+              <span class="metric-label">累计总词元</span>
+              <strong id="sm-tok-total" class="stat-val tabular">0</strong>
+              <span id="sm-tok-sub-total" class="metric-sub tabular">含输入与输出</span>
+            </div>
+            <div class="stat-item">
+              <span class="metric-label">缓存命中读取</span>
+              <strong id="sm-tok-cache" class="stat-val tabular">0</strong>
+              <span id="sm-tok-cw" class="metric-sub tabular">免重复计费</span>
+            </div>
+            <div class="stat-item">
+              <span class="metric-label">未命中新输入</span>
+              <strong id="sm-tok-in" class="stat-val tabular">0</strong>
+              <span id="sm-tok-prompt-bytes" class="metric-sub tabular">新鲜 Prompt</span>
+            </div>
+            <div class="stat-item">
+              <span class="metric-label">累计总输出</span>
+              <strong id="sm-tok-out" class="stat-val tabular">0</strong>
+              <span id="sm-tok-out-split" class="metric-sub tabular">—</span>
+            </div>
+          </div>
+
+          <div id="sm-api-grid" class="stat-grid-2 stat-grid-border hidden">
+            <div class="stat-item">
+              <span class="metric-label">首字延迟 TTFT</span>
+              <strong id="sm-ttft-val" class="stat-val tabular">—</strong>
+              <span id="sm-ttft-sub" class="metric-sub tabular">均值 —</span>
+            </div>
+            <div class="stat-item">
+              <span class="metric-label">流式解码速率</span>
+              <strong id="sm-decode-val" class="stat-val tabular">—</strong>
+              <span id="sm-decode-sub" class="metric-sub tabular">耗时 —</span>
+            </div>
+            <div class="stat-item">
+              <span class="metric-label">上下文窗口</span>
+              <strong id="sm-ctx-pct" class="stat-val tabular">—</strong>
+              <span id="sm-ctx-sub" class="metric-sub tabular">—</span>
+            </div>
+            <div class="stat-item">
+              <span class="metric-label">重试与费用</span>
+              <strong id="sm-retries-val" class="stat-val tabular">0 次</strong>
+              <span id="sm-retries-sub" class="metric-sub tabular">接口无重试</span>
+            </div>
+          </div>
+
+          <div id="sm-breakdown-wrap" class="breakdown-wrap hidden">
+            <div class="breakdown-head">
+              <span class="metric-label">上下文窗口构成</span>
+              <span id="sm-breakdown-total" class="metric-sub tabular"></span>
+            </div>
+            <div id="sm-breakdown-bar" class="stacked-bar"></div>
+            <div id="sm-breakdown-legend" class="breakdown-legend"></div>
+          </div>
+        </article>
+
+        <!-- 3. 全机所有已统计会话累计 -->
+        <article id="global-usage-section" class="stat-card">
+          <div class="stat-card-head">
+            <div class="sec-title-group">
+              <span class="sec-title">全机已统计会话</span>
+              <span id="gu-scan-meta" class="sec-meta tabular">0 会话</span>
+            </div>
+            <div class="mini-seg" role="group" aria-label="全局词元范围">
+              <button type="button" class="mini-seg-btn active" data-gu-scope="all">全部</button>
+              <button type="button" class="mini-seg-btn" data-gu-scope="today">今日</button>
+            </div>
+          </div>
+
+          <div class="stat-grid-2">
+            <div class="stat-item">
+              <span class="metric-label">累计总词元</span>
+              <strong id="gu-tok-total" class="stat-val tabular">0</strong>
+              <span id="gu-calls-sub" class="metric-sub tabular">0 次调用</span>
+            </div>
+            <div class="stat-item">
+              <span class="metric-label">全局缓存命中率</span>
+              <strong id="gu-cache-rate" class="stat-val tabular">—</strong>
+              <span id="gu-cache-read" class="metric-sub tabular">命中 0</span>
+            </div>
+            <div class="stat-item">
+              <span class="metric-label">未命中新输入</span>
+              <strong id="gu-tok-in" class="stat-val tabular">0</strong>
+              <span id="gu-retries" class="metric-sub tabular">重试 0 次</span>
+            </div>
+            <div class="stat-item">
+              <span class="metric-label">累计总输出</span>
+              <strong id="gu-tok-out" class="stat-val tabular">0</strong>
+              <span id="gu-out-split" class="metric-sub tabular">—</span>
+            </div>
+          </div>
+
+          <div id="gu-top-wrap" class="top-sessions-wrap hidden">
+            <div class="breakdown-head">
+              <span id="gu-top-heading" class="metric-label">词元消耗最高会话</span>
+              <span class="metric-sub">点击查看详情</span>
+            </div>
+            <div id="gu-top-list" class="flat-list"></div>
+          </div>
+        </article>
+
+        <!-- 4. 账号与模型配额（仅当 GetUserStatus 接口返回数据时显示） -->
+        <article id="quota-section" class="stat-card hidden">
+          <div class="stat-card-head">
+            <div class="sec-title-group">
+              <span class="sec-title">模型配额余量</span>
+              <span id="quota-plan-tag" class="ws-tag hidden"></span>
+            </div>
+            <span id="quota-credits-meta" class="sec-meta tabular"></span>
+          </div>
+          <div id="quota-list" class="quota-list"></div>
+        </article>
+      </section>
+
+      <!-- 视图三：执行轨迹 -->
       <section id="view-timeline" class="tab-panel" role="tabpanel">
         <div class="filter-bar">
           <button type="button" class="chip active" data-filter="all">全部</button>

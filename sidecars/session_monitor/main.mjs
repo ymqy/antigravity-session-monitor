@@ -33,12 +33,34 @@ import {
   parsePsOutput,
   parseTranscript,
 } from './state_engine.mjs';
+import {
+  aggregateGeneratorRows,
+  aggregateGlobalUsage,
+  buildNetworkSnapshot as buildNetworkSnapshotPure,
+  computeCacheHitRate,
+  createEmptyTrafficLedger,
+  decodeGeneratorMetadataRow,
+  decodeStepCreatedAtMs,
+  extractProxyPortsFromEnv,
+  identifyAntigravityPids,
+  identifyProxyPids,
+  localDateKey,
+  normalizeTrafficLedger,
+  parseNettopSockets,
+  parseScutilProxyPorts,
+  parseUserStatusQuota,
+  resetTrafficLedger,
+  updateTrafficLedger,
+} from './metrics_engine.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ID_RE = /^[0-9a-fA-F-]{8,64}$/;
 const BOOTED_AT = Date.now();
 const GLOBAL_LOOKBACK_MS = 8 * 60 * 60 * 1000; // Scan sessions active in last 8h
 const PS_TTL_MS = 2000;
+const NETTOP_TTL_MS = 2500;
+const QUOTA_TTL_MS = 60_000;
+const GLOBAL_USAGE_SCAN_TTL_MS = 5000;
 const GLOBAL_SCAN_TTL_MS = 1000;
 
 const STATIC_ASSETS = {
@@ -294,6 +316,60 @@ function readConvDbStepsInfo(appData, convId) {
   }
 }
 
+const convUsageCache = new Map(); // dbPath -> { sig, liveKey, metrics }
+
+function readConvUsageMetrics(appData, convId, liveStepCount = null, fallbackMs = 0) {
+  if (!DatabaseSync || !appData || !convId) return null;
+  const dbPath = join(appData, 'conversations', `${convId}.db`);
+  const sig = sqliteFileSig(dbPath);
+  if (!sig) return null;
+
+  const liveKey = liveStepCount == null ? '-' : String(liveStepCount);
+  const cached = convUsageCache.get(dbPath);
+  if (cached && cached.sig === sig && cached.liveKey === liveKey) {
+    return cached.metrics;
+  }
+
+  let db = null;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true, timeout: 150 });
+    const stepRows = db.prepare(
+      'SELECT idx, metadata FROM steps WHERE step_type IN (15, 23) AND metadata IS NOT NULL',
+    ).all();
+    const stepCreatedAtMap = new Map();
+    for (const r of stepRows) {
+      if (!r?.metadata) continue;
+      const ms = decodeStepCreatedAtMs(r.metadata);
+      if (ms) stepCreatedAtMap.set(Number(r.idx), ms);
+    }
+
+    const genRows = db.prepare('SELECT data FROM gen_metadata ORDER BY idx ASC').all();
+    const decoded = [];
+    for (const r of genRows) {
+      if (!r?.data) continue;
+      const d = decodeGeneratorMetadataRow(r.data);
+      if (d) decoded.push(d);
+    }
+
+    const dbStat = statOf(dbPath);
+    const metrics = {
+      sig,
+      ...aggregateGeneratorRows(decoded, stepCreatedAtMap, {
+        liveStepCount,
+        fallbackMs: fallbackMs || dbStat.mtime || Date.now(),
+        includeStepMap: true,
+      }),
+    };
+    if (convUsageCache.size > 120) convUsageCache.clear();
+    convUsageCache.set(dbPath, { sig, liveKey, metrics });
+    return metrics;
+  } catch {
+    return cached?.metrics || null;
+  } finally {
+    try { db?.close(); } catch {}
+  }
+}
+
 function readRuntimeMeta(appData, convId) {
   const summary = getSummaryRow(appData, convId);
   const convDb = readConvDbStepsInfo(appData, convId);
@@ -388,6 +464,472 @@ function saveSettings(patch) {
 }
 
 let userSettings = loadSettings();
+
+// ---------------------------------------------------------------------------
+// 持久化 OS 级网络流量监控（macOS `nettop` 套接字增量账本）
+// ---------------------------------------------------------------------------
+
+const trafficLedgerPath = join(sidecarDataDir, 'network_traffic.json');
+const NETTOP_BIN = '/usr/bin/nettop';
+const SCUTIL_BIN = '/usr/sbin/scutil';
+const NETTOP_AVAILABLE = process.platform === 'darwin' && existsSync(NETTOP_BIN);
+const SCUTIL_AVAILABLE = process.platform === 'darwin' && existsSync(SCUTIL_BIN);
+const ENV_PROXY_PORTS = extractProxyPortsFromEnv(process.env);
+const SCUTIL_TTL_MS = 30_000;
+
+let scutilProxyCache = { at: 0, ports: new Set(), inflight: null };
+
+function refreshScutilProxyPorts(now = Date.now()) {
+  if (!SCUTIL_AVAILABLE) return Promise.resolve(scutilProxyCache.ports);
+  if (scutilProxyCache.at > 0 && now - scutilProxyCache.at < SCUTIL_TTL_MS) {
+    return Promise.resolve(scutilProxyCache.ports);
+  }
+  if (scutilProxyCache.inflight) return scutilProxyCache.inflight;
+  scutilProxyCache.inflight = new Promise((resolve) => {
+    execFile(SCUTIL_BIN, ['--proxy'], { encoding: 'utf-8', timeout: 1000 }, (err, stdout) => {
+      scutilProxyCache.inflight = null;
+      if (!err && stdout) {
+        scutilProxyCache.ports = parseScutilProxyPorts(stdout);
+      }
+      scutilProxyCache.at = Date.now();
+      resolve(scutilProxyCache.ports);
+    });
+  });
+  return scutilProxyCache.inflight;
+}
+
+function loadTrafficLedger() {
+  try {
+    if (existsSync(trafficLedgerPath)) {
+      return normalizeTrafficLedger(JSON.parse(readFileSync(trafficLedgerPath, 'utf-8')), Date.now());
+    }
+  } catch {
+    // 损坏文件静默重建
+  }
+  return createEmptyTrafficLedger(Date.now());
+}
+
+function saveTrafficLedgerSync(ledger) {
+  try {
+    mkdirSync(sidecarDataDir, { recursive: true });
+    const tmp = `${trafficLedgerPath}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(ledger), 'utf-8');
+    renameSync(tmp, trafficLedgerPath);
+  } catch (err) {
+    console.error('[session-monitor] 保存网络流量账本失败:', err.message);
+  }
+}
+
+let trafficLedger = loadTrafficLedger();
+let trafficLastSavedAt = 0;
+let trafficDirty = false;
+let trafficResetGen = 0;
+let trafficCache = {
+  at: 0,
+  inflight: null,
+  lastSample: null,
+  snapshot: null,
+};
+
+function buildNetworkSnapshot(ledger, sample, now) {
+  return buildNetworkSnapshotPure(ledger, sample, now, { available: NETTOP_AVAILABLE });
+}
+
+function sampleNettopOnce(psRows, timeoutMs = 2200) {
+  if (!NETTOP_AVAILABLE) return Promise.resolve(null);
+  return Promise.all([
+    refreshScutilProxyPorts(Date.now()),
+    new Promise((resolve) => {
+      execFile(
+        NETTOP_BIN,
+        ['-L', '1', '-n', '-J', 'interface,state,bytes_in,bytes_out', '-x'],
+        { encoding: 'utf-8', timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 },
+        (err, stdout) => resolve(!err && stdout ? stdout : null),
+      );
+    }),
+  ]).then(([sysProxyPorts, stdout]) => {
+    if (!stdout) return null;
+    const { agyPids, procLabels } = identifyAntigravityPids(psRows, { ownPid: process.pid });
+    const proxyPids = identifyProxyPids(psRows);
+    const proxyPorts = new Set([...ENV_PROXY_PORTS, ...(sysProxyPorts || [])]);
+    const sample = parseNettopSockets(stdout, agyPids, {
+      procLabels,
+      proxyPorts,
+      proxyPids,
+    });
+    return { agyPids, sample };
+  });
+}
+
+function refreshNetworkTraffic(psRows, now = Date.now()) {
+  if (!NETTOP_AVAILABLE) {
+    return Promise.resolve(buildNetworkSnapshot(trafficLedger, null, now));
+  }
+  if (
+    trafficCache.snapshot
+    && now - trafficCache.at < NETTOP_TTL_MS
+    && trafficCache.snapshot.todayDate === localDateKey(now)
+  ) {
+    return Promise.resolve(trafficCache.snapshot);
+  }
+  if (trafficCache.inflight) return trafficCache.inflight;
+
+  const genAtStart = trafficResetGen;
+  trafficCache.inflight = sampleNettopOnce(psRows, 2200).then((res) => {
+    trafficCache.inflight = null;
+    const sampleNow = Date.now();
+    // 若采样途中触发了用户清零重置，丢弃过期增量，防止重置前旧字节回弹
+    if (genAtStart !== trafficResetGen) {
+      trafficCache.snapshot = buildNetworkSnapshot(trafficLedger, trafficCache.lastSample, sampleNow);
+      return trafficCache.snapshot;
+    }
+    if (res) {
+      const { agyPids, sample } = res;
+      // 仅在检测到 Antigravity 进程或存在外网/回环套接字时更新账本，防止瞬态异常误清基线
+      if (agyPids.size > 0 || sample.externalSockets.length > 0 || sample.loopbackSockets.length > 0) {
+        const { ledger: nextLedger, deltaIn, deltaOut } = updateTrafficLedger(trafficLedger, sample, sampleNow);
+        trafficLedger = nextLedger;
+        trafficCache.lastSample = sample;
+        if (deltaIn > 0 || deltaOut > 0 || !trafficLastSavedAt) {
+          trafficDirty = true;
+        }
+        if (trafficDirty && (sampleNow - trafficLastSavedAt >= 12_000 || (deltaIn + deltaOut) >= 256 * 1024)) {
+          saveTrafficLedgerSync(trafficLedger);
+          trafficLastSavedAt = sampleNow;
+          trafficDirty = false;
+        }
+      }
+      trafficCache.at = sampleNow;
+    }
+    trafficCache.snapshot = buildNetworkSnapshot(trafficLedger, trafficCache.lastSample, sampleNow);
+    return trafficCache.snapshot;
+  });
+  return trafficCache.inflight;
+}
+
+// 后台兜底采样（即使面板标签切走也能持续接住关闭前的 HTTP/2 连接流量增量）
+if (NETTOP_AVAILABLE) {
+  const bgNetTimer = setInterval(async () => {
+    if (Date.now() - trafficCache.at < 4500) return;
+    try {
+      const rows = await refreshPsRows();
+      await refreshNetworkTraffic(rows, Date.now());
+    } catch {
+      // 静默忽略瞬态失败
+    }
+  }, 5000);
+  bgNetTimer.unref?.();
+}
+
+// ---------------------------------------------------------------------------
+// 全局全会话累计 Token 与缓存总账（增量磁盘缓存 + 异步分批扫描，绝不阻塞主请求）
+// ---------------------------------------------------------------------------
+
+const usageCachePath = join(sidecarDataDir, 'usage_cache.json');
+let globalUsageEntries = new Map(); // `${appData}|${convId}` -> { appData, convId, sig, totals, byDate, mtime }
+let globalUsageDirty = false;
+let globalUsageLastSavedAt = 0;
+let globalUsageScanState = {
+  scanning: false,
+  lastScanAt: 0,
+  totalDbCount: 0,
+  lastDirSig: '',
+  version: 0,
+};
+
+const USAGE_CACHE_VERSION = 3;
+
+function loadGlobalUsageCache() {
+  try {
+    if (!existsSync(usageCachePath)) return;
+    const raw = JSON.parse(readFileSync(usageCachePath, 'utf-8'));
+    if (raw?.version !== USAGE_CACHE_VERSION || !raw.entries || typeof raw.entries !== 'object') return;
+    for (const [k, v] of Object.entries(raw.entries)) {
+      if (v && typeof v === 'object' && v.sig && v.totals && v.convId) {
+        globalUsageEntries.set(k, v);
+      }
+    }
+  } catch {
+    // 损坏缓存忽略重建
+  }
+}
+loadGlobalUsageCache();
+
+function saveGlobalUsageCacheSync() {
+  try {
+    mkdirSync(sidecarDataDir, { recursive: true });
+    const entries = {};
+    for (const [k, v] of globalUsageEntries.entries()) {
+      entries[k] = v;
+    }
+    const tmp = `${usageCachePath}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify({ version: USAGE_CACHE_VERSION, entries }), 'utf-8');
+    renameSync(tmp, usageCachePath);
+  } catch (err) {
+    console.error('[session-monitor] 保存全局用量缓存失败:', err.message);
+  }
+}
+
+function scanSingleDbForGlobal(appData, convId, dbPath, sig) {
+  let db = null;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true, timeout: 80 });
+    const stepRows = db.prepare(
+      'SELECT idx, metadata FROM steps WHERE step_type IN (15, 23) AND metadata IS NOT NULL',
+    ).all();
+    const stepCreatedAtMap = new Map();
+    for (const r of stepRows) {
+      if (!r?.metadata) continue;
+      const ms = decodeStepCreatedAtMs(r.metadata);
+      if (ms) stepCreatedAtMap.set(Number(r.idx), ms);
+    }
+    const genRows = db.prepare('SELECT data FROM gen_metadata ORDER BY idx ASC').all();
+    const decoded = [];
+    for (const r of genRows) {
+      if (!r?.data) continue;
+      const d = decodeGeneratorMetadataRow(r.data);
+      if (d) decoded.push(d);
+    }
+    const st = statOf(dbPath);
+    const agg = aggregateGeneratorRows(decoded, stepCreatedAtMap, {
+      fallbackMs: st.mtime || Date.now(),
+      includeStepMap: false,
+    });
+    return {
+      appData,
+      convId,
+      sig,
+      mtime: st.mtime || 0,
+      totals: agg.totals,
+      byDate: agg.byDate,
+    };
+  } catch {
+    return null;
+  } finally {
+    try { db?.close(); } catch {}
+  }
+}
+
+function scheduleGlobalUsageScan(now = Date.now()) {
+  if (!DatabaseSync || globalUsageScanState.scanning) return;
+  const appDataDirs = findAppDataDirs();
+  const dirSig = appDataDirs
+    .map((d) => `${d}:${statOf(join(d, 'conversations')).mtime}:${sqliteFileSig(join(d, 'conversation_summaries.db'))}`)
+    .join('|');
+  if (
+    dirSig === globalUsageScanState.lastDirSig
+    && now - globalUsageScanState.lastScanAt < GLOBAL_USAGE_SCAN_TTL_MS
+  ) {
+    return;
+  }
+
+  const pending = [];
+  const aliveKeys = new Set();
+  for (const appData of appDataDirs) {
+    const convDir = join(appData, 'conversations');
+    const files = safeReaddir(convDir);
+    for (const f of files) {
+      if (!f.endsWith('.db')) continue;
+      const convId = f.slice(0, -3);
+      if (!ID_RE.test(convId)) continue;
+      const dbPath = join(convDir, f);
+      const sig = sqliteFileSig(dbPath);
+      if (!sig) continue;
+      const key = `${appData}|${convId}`;
+      aliveKeys.add(key);
+      const existing = globalUsageEntries.get(key);
+      if (!existing || existing.sig !== sig) {
+        pending.push({ key, appData, convId, dbPath, sig });
+      }
+    }
+  }
+
+  // 清理已删除会话的缓存条目
+  let pruned = false;
+  for (const k of [...globalUsageEntries.keys()]) {
+    if (!aliveKeys.has(k)) {
+      globalUsageEntries.delete(k);
+      pruned = true;
+    }
+  }
+  if (pruned) {
+    globalUsageDirty = true;
+    globalUsageScanState.version += 1;
+  }
+
+  globalUsageScanState.totalDbCount = aliveKeys.size;
+  globalUsageScanState.lastDirSig = dirSig;
+  globalUsageScanState.lastScanAt = now;
+
+  if (!pending.length) {
+    if (globalUsageDirty && now - globalUsageLastSavedAt >= 15_000) {
+      saveGlobalUsageCacheSync();
+      globalUsageLastSavedAt = now;
+      globalUsageDirty = false;
+    }
+    return;
+  }
+
+  // 优先扫描最近修改的 DB，每帧最多处理 5 个，确保事件循环零卡顿
+  pending.sort((a, b) => statOf(b.dbPath).mtime - statOf(a.dbPath).mtime);
+  globalUsageScanState.scanning = true;
+  let cursor = 0;
+
+  const processBatch = () => {
+    const end = Math.min(pending.length, cursor + 5);
+    let updatedAny = false;
+    for (; cursor < end; cursor++) {
+      const item = pending[cursor];
+      const res = scanSingleDbForGlobal(item.appData, item.convId, item.dbPath, item.sig);
+      if (res) {
+        globalUsageEntries.set(item.key, res);
+        updatedAny = true;
+      }
+    }
+    if (updatedAny) {
+      globalUsageDirty = true;
+      globalUsageScanState.version += 1;
+    }
+    if (cursor < pending.length) {
+      setImmediate(processBatch);
+    } else {
+      globalUsageScanState.scanning = false;
+      globalUsageScanState.lastScanAt = Date.now();
+      if (globalUsageDirty) {
+        saveGlobalUsageCacheSync();
+        globalUsageLastSavedAt = Date.now();
+        globalUsageDirty = false;
+      }
+    }
+  };
+  setImmediate(processBatch);
+}
+
+function buildGlobalUsageSnapshot(now = Date.now()) {
+  scheduleGlobalUsageScan(now);
+  const todayKey = localDateKey(now);
+  const { allTime, today, sessionRank, todayRank } = aggregateGlobalUsage(globalUsageEntries.values(), todayKey);
+
+  const hydrateTopList = (rankArr) => {
+    rankArr.sort((a, b) => b.totalTokens - a.totalTokens);
+    const out = [];
+    for (const s of rankArr) {
+      if (out.length >= 5) break;
+      const sumRow = getSummaryRow(s.appData, s.conversationId);
+      if (!sumRow && !existsSync(join(s.appData, 'conversations', `${s.conversationId}.db`))) {
+        continue;
+      }
+      const isSub = Boolean(sumRow?.parentConversationId || (sumRow?.nestingDepth || 0) > 0 || sumRow?.agentName);
+      const wsName = sumRow?.workspacePaths?.[0] ? basename(sumRow.workspacePaths[0]) : '';
+      out.push({
+        conversationId: s.conversationId,
+        title: sumRow?.title || `会话 ${s.conversationId.slice(0, 8)}`,
+        workspaceName: wsName,
+        isSubagent: isSub,
+        totalTokens: s.totalTokens,
+        cacheHitRate: s.cacheHitRate,
+        apiCalls: s.apiCalls,
+        output: s.output,
+      });
+    }
+    return out;
+  };
+
+  const topSessions = hydrateTopList(sessionRank);
+  const topSessionsToday = hydrateTopList(todayRank);
+
+  return {
+    available: Boolean(DatabaseSync),
+    scanning: globalUsageScanState.scanning,
+    scannedCount: globalUsageEntries.size,
+    totalDbCount: globalUsageScanState.totalDbCount || globalUsageEntries.size,
+    version: globalUsageScanState.version,
+    allTime,
+    today,
+    topSessions,
+    topSessionsToday,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 本地 `language_server` `GetUserStatus` 模型配额查询（60s TTL，失败静默降级）
+// ---------------------------------------------------------------------------
+
+let quotaCache = { at: 0, inflight: null, raw: null, version: 0 };
+
+function resolveLanguageServerEndpoint() {
+  const envAddr = process.env.ANTIGRAVITY_LS_ADDRESS;
+  const envCsrf = process.env.ANTIGRAVITY_CSRF_TOKEN;
+  if (envAddr && envCsrf) {
+    const addr = envAddr.startsWith('http://') || envAddr.startsWith('https://')
+      ? envAddr.replace(/\/+$/, '')
+      : `http://${envAddr.replace(/^localhost\b/, '127.0.0.1')}`;
+    return { baseUrl: addr, csrfToken: envCsrf };
+  }
+  for (const appData of findAppDataDirs()) {
+    const daemonDir = join(appData, 'daemon');
+    const files = safeReaddir(daemonDir)
+      .filter((f) => f.endsWith('.json'))
+      .map((f) => ({ full: join(daemonDir, f), mtime: statOf(join(daemonDir, f)).mtime }))
+      .sort((a, b) => b.mtime - a.mtime);
+    for (const f of files) {
+      try {
+        const obj = JSON.parse(readFileSync(f.full, 'utf-8'));
+        if (obj?.httpPort && obj?.csrfToken) {
+          return { baseUrl: `http://127.0.0.1:${obj.httpPort}`, csrfToken: obj.csrfToken };
+        }
+      } catch {
+        // 忽略无效文件
+      }
+    }
+  }
+  return null;
+}
+
+function triggerQuotaRefresh(now = Date.now()) {
+  if (quotaCache.inflight) return quotaCache.inflight;
+  if (quotaCache.at > 0 && now - quotaCache.at < QUOTA_TTL_MS) return Promise.resolve(quotaCache.raw);
+
+  const ep = resolveLanguageServerEndpoint();
+  if (!ep) {
+    quotaCache.at = now;
+    return Promise.resolve(quotaCache.raw);
+  }
+
+  quotaCache.inflight = fetch(
+    `${ep.baseUrl}/exa.language_server_pb.LanguageServerService/GetUserStatus`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Connect-Protocol-Version': '1',
+        'X-Codeium-Csrf-Token': ep.csrfToken,
+      },
+      body: JSON.stringify({
+        metadata: { ideName: 'antigravity', extensionName: 'antigravity', locale: 'zh-CN' },
+      }),
+      signal: AbortSignal.timeout(1800),
+    },
+  )
+    .then((res) => (res.ok ? res.json() : null))
+    .then((json) => {
+      if (json && typeof json === 'object') {
+        quotaCache.raw = json;
+        quotaCache.version += 1;
+      }
+      quotaCache.at = Date.now();
+      return quotaCache.raw;
+    })
+    .catch(() => {
+      quotaCache.at = Date.now();
+      return quotaCache.raw;
+    })
+    .finally(() => {
+      quotaCache.inflight = null;
+    });
+
+  return quotaCache.inflight;
+}
 
 // ---------------------------------------------------------------------------
 // Conversation Titles via `agentapi` (Async Cached)
@@ -555,6 +1097,7 @@ function cleanupOrphanHookSession(appData, convId, now) {
   fileCache.delete(trPath);
   parsedTranscriptCache.delete(trPath);
   convDbCache.delete(join(appData, 'conversations', `${convId}.db`));
+  convUsageCache.delete(join(appData, 'conversations', `${convId}.db`));
   titleCache.delete(convId);
 }
 
@@ -620,6 +1163,7 @@ function summarizeSubagent(appData, ref, psRows, now, summaryMap = null) {
   const runtimeMeta = readRuntimeMeta(appData, subId);
   const trEntry = getParsedTranscript(appData, subId, hook.data, runtimeMeta);
   const tr = trEntry.parsed;
+  const subUsage = readConvUsageMetrics(appData, subId, runtimeMeta?.liveStepCount, runtimeMeta?.lastModifiedMs || tr.lastStepAtMs || 0);
   const effectiveWorkspacePaths = hook.data?.workspacePaths?.length
     ? hook.data.workspacePaths
     : (runtimeMeta?.workspacePaths || []);
@@ -644,12 +1188,31 @@ function summarizeSubagent(appData, ref, psRows, now, summaryMap = null) {
   });
 
   const isRunning = ['THINKING', 'THINKING_DEEP', 'TOOL_ACTIVE', 'RETRYING', 'SUBAGENT_RUNNING'].includes(health.state);
+  const uTotals = subUsage?.totals?.apiCalls ? subUsage.totals : null;
+  const subTokens = uTotals
+    ? {
+      input: uTotals.input,
+      cache: uTotals.cacheRead,
+      cacheWrite: uTotals.cacheWrite,
+      output: uTotals.output,
+      thinkingOutput: uTotals.thinkingOutput,
+      responseOutput: uTotals.responseOutput,
+      total: uTotals.totalTokens,
+      cacheHitRate: uTotals.cacheHitRate,
+      currentContext: tr.tokens.currentContext,
+    }
+    : {
+      ...tr.tokens,
+      cacheWrite: 0,
+      thinkingOutput: 0,
+      responseOutput: 0,
+    };
 
   return {
     conversationId: subId,
     role: ref.role || '子代理',
     typeName: ref.typeName || 'subagent',
-    model: ref.model || health.modelName || '',
+    model: ref.model || health.modelName || subUsage?.latest?.modelDisplayName || '',
     state: health.state,
     severity: health.severity,
     badge: health.badge,
@@ -658,11 +1221,16 @@ function summarizeSubagent(appData, ref, psRows, now, summaryMap = null) {
     elapsedSec: health.elapsedSec || 0,
     startedAtMs: health.startedAtMs || ref.startedAtMs || null,
     stepCount: tr.stepCount,
-    tokens: tr.tokens,
+    apiCalls: uTotals?.apiCalls || 0,
+    retries: uTotals?.retries || 0,
+    modelCost: uTotals?.modelCost || 0,
+    creditCost: uTotals?.creditCost || 0,
+    hasThinkingBreakdown: Boolean(uTotals?.hasThinkingBreakdown),
+    tokens: subTokens,
     tokenSpeed: tr.tokenSpeed,
     isRunning,
     inCurrentTurn: ref.inCurrentTurn !== false,
-    key: `${hook.key}|${trEntry.key}|${health.state}|${tr.tokenSpeed.latestTps ?? '-'}|${tr.tokenSpeed.turnLatestTps ?? '-'}`,
+    key: `${hook.key}|${trEntry.key}|${subUsage?.sig || '-'}|${health.state}|${tr.tokenSpeed.latestTps ?? '-'}|${tr.tokenSpeed.turnLatestTps ?? '-'}`,
   };
 }
 
@@ -677,7 +1245,23 @@ function createEmptySnapshot(now, extra = {}) {
     subagents: [],
     bgTasks: [],
     rounds: [],
-    tokens: { input: 0, cache: 0, output: 0, currentContext: 0 },
+    tokens: {
+      input: 0,
+      cache: 0,
+      cacheWrite: 0,
+      output: 0,
+      thinkingOutput: 0,
+      responseOutput: 0,
+      currentContext: 0,
+      maxContextTokens: 0,
+      contextUsagePercent: null,
+      total: 0,
+      grandTotalTokens: 0,
+      grandTotalOutput: 0,
+      cacheHitRate: null,
+      latestCacheHitRate: null,
+    },
+    metrics: null,
     tokenSpeed: {
       latestTps: null,
       turnLatestTps: null,
@@ -710,6 +1294,7 @@ function buildConversationSnapshot(convId, psRows, now) {
   const runtimeMeta = readRuntimeMeta(appData, convId);
   const trEntry = getParsedTranscript(appData, convId, hook.data, runtimeMeta);
   const tr = trEntry.parsed;
+  const convUsage = readConvUsageMetrics(appData, convId, runtimeMeta?.liveStepCount, runtimeMeta?.lastModifiedMs || tr.lastStepAtMs || 0);
   const msEntry = readConversationMilestones(appData, convId);
   const effectiveWorkspacePaths = hook.data?.workspacePaths?.length
     ? hook.data.workspacePaths
@@ -761,15 +1346,133 @@ function buildConversationSnapshot(convId, psRows, now) {
     ? basename(effectiveWorkspacePaths[0])
     : '';
 
-  // Aggregate total tokens including subagents
+  // Aggregate total tokens & detailed API metrics including subagents
   const subTokens = subagents.reduce(
     (acc, s) => ({
       input: acc.input + (s.tokens?.input || 0),
       cache: acc.cache + (s.tokens?.cache || 0),
+      cacheWrite: acc.cacheWrite + (s.tokens?.cacheWrite || 0),
       output: acc.output + (s.tokens?.output || 0),
+      thinkingOutput: acc.thinkingOutput + (s.tokens?.thinkingOutput || 0),
+      responseOutput: acc.responseOutput + (s.tokens?.responseOutput || 0),
+      hasThinkingBreakdown: acc.hasThinkingBreakdown || Boolean(s.hasThinkingBreakdown),
+      apiCalls: acc.apiCalls + (s.apiCalls || 0),
+      retries: acc.retries + (s.retries || 0),
+      modelCost: acc.modelCost + (s.modelCost || 0),
+      creditCost: acc.creditCost + (s.creditCost || 0),
     }),
-    { input: 0, cache: 0, output: 0 },
+    {
+      input: 0,
+      cache: 0,
+      cacheWrite: 0,
+      output: 0,
+      thinkingOutput: 0,
+      responseOutput: 0,
+      hasThinkingBreakdown: false,
+      apiCalls: 0,
+      retries: 0,
+      modelCost: 0,
+      creditCost: 0,
+    },
   );
+
+  const hasGenMeta = Boolean(convUsage?.totals?.apiCalls > 0);
+  // 无 SQLite 降级到 transcript.jsonl 时，并入 CHECKPOINT 压缩步骤消耗的 Token，与 gen_metadata 口径对齐
+  const cpTok = tr.checkpointTokens || { input: 0, cache: 0, output: 0 };
+  const mainInput = hasGenMeta ? convUsage.totals.input : (tr.tokens.input + (cpTok.input || 0));
+  const mainCacheRead = hasGenMeta ? convUsage.totals.cacheRead : (tr.tokens.cache + (cpTok.cache || 0));
+  const mainCacheWrite = hasGenMeta ? convUsage.totals.cacheWrite : 0;
+  const mainOutput = hasGenMeta ? convUsage.totals.output : (tr.tokens.output + (cpTok.output || 0));
+  const mainThinkingOutput = hasGenMeta ? convUsage.totals.thinkingOutput : 0;
+  const mainResponseOutput = hasGenMeta ? convUsage.totals.responseOutput : 0;
+  const hasThinkingBreakdown = Boolean((hasGenMeta && convUsage.totals.hasThinkingBreakdown) || subTokens.hasThinkingBreakdown);
+  const mainPromptTokens = mainInput + mainCacheRead + mainCacheWrite;
+  const mainTotalTokens = mainPromptTokens + mainOutput;
+  const subTotalTokens = subTokens.input + subTokens.cache + subTokens.cacheWrite + subTokens.output;
+  const grandTotalTokens = mainTotalTokens + subTotalTokens;
+  const mainCacheHitRate = computeCacheHitRate(mainInput, mainCacheRead, mainCacheWrite);
+  const grandCacheHitRate = computeCacheHitRate(
+    mainInput + subTokens.input,
+    mainCacheRead + subTokens.cache,
+    mainCacheWrite + subTokens.cacheWrite,
+  );
+  const latestCacheHitRate = hasGenMeta
+    ? (convUsage.latest?.cacheHitRate ?? tr.tokens.latestCacheHitRate)
+    : tr.tokens.latestCacheHitRate;
+  const maxContextTokens = convUsage?.latest?.maxContextTokens || 0;
+  // 若 transcript 缺失或超大未读出（stepCount === 0），回落至 gen_metadata 最新调用的上下文占用，不覆盖压缩后的合法归零态
+  let currentContext = tr.tokens.currentContext;
+  if (currentContext === 0 && tr.stepCount === 0 && convUsage?.latest) {
+    currentContext = (convUsage.latest.input || 0)
+      + (convUsage.latest.cacheRead || 0)
+      + (convUsage.latest.cacheWrite || 0)
+      || convUsage.latest.estimatedTokensUsed
+      || 0;
+  }
+  const contextUsagePercent = maxContextTokens > 0 && currentContext > 0
+    ? Math.min(100, Math.round((currentContext / maxContextTokens) * 1000) / 10)
+    : null;
+  const effectiveModelDisplay = convUsage?.latest?.modelDisplayName
+    || hook.data?.modelName
+    || tr.modelId
+    || '';
+  const totalModelCost = Math.round(((convUsage?.totals?.modelCost || 0) + subTokens.modelCost) * 10000) / 10000;
+  const totalCreditCost = (convUsage?.totals?.creditCost || 0) + subTokens.creditCost;
+  const latestPromptBytes = convUsage?.latest?.storedPromptBytes || 0;
+
+  const sessionMetrics = {
+    source: hasGenMeta ? 'sqlite_gen_metadata' : 'transcript',
+    apiCalls: hasGenMeta ? convUsage.totals.apiCalls : tr.rounds.filter((r) => r.kind === 'planner').length,
+    subagentApiCalls: subTokens.apiCalls,
+    tokens: {
+      input: mainInput,
+      cacheRead: mainCacheRead,
+      cacheWrite: mainCacheWrite,
+      output: mainOutput,
+      thinkingOutput: mainThinkingOutput,
+      responseOutput: mainResponseOutput,
+      hasThinkingBreakdown,
+      promptTokens: mainPromptTokens,
+      totalTokens: mainTotalTokens,
+      currentContext,
+      maxContextTokens,
+      contextUsagePercent,
+      latestPromptBytes,
+      subagentInput: subTokens.input,
+      subagentCacheRead: subTokens.cache,
+      subagentCacheWrite: subTokens.cacheWrite,
+      subagentOutput: subTokens.output,
+      subagentThinkingOutput: subTokens.thinkingOutput,
+      subagentResponseOutput: subTokens.responseOutput,
+      subagentTotalTokens: subTotalTokens,
+      grandTotalTokens,
+      grandTotalOutput: mainOutput + subTokens.output,
+    },
+    cache: {
+      hitRate: mainCacheHitRate,
+      latestHitRate: latestCacheHitRate,
+      grandHitRate: grandCacheHitRate,
+      savedTokens: mainCacheRead + subTokens.cache,
+      cacheWriteTokens: mainCacheWrite + subTokens.cacheWrite,
+    },
+    latency: {
+      latestTtftMs: convUsage?.latest?.ttftMs ?? null,
+      avgTtftMs: convUsage?.totals?.avgTtftMs ?? null,
+      maxTtftMs: convUsage?.totals?.maxTtftMs ?? null,
+      latestStreamMs: convUsage?.latest?.streamMs ?? null,
+      avgStreamMs: convUsage?.totals?.avgStreamMs ?? null,
+      latestDecodeTps: convUsage?.latest?.decodeTps ?? null,
+      avgDecodeTps: convUsage?.totals?.decodeTps ?? null,
+    },
+    quality: {
+      retries: (convUsage?.totals?.retries || 0) + subTokens.retries,
+      modelCost: totalModelCost,
+      creditCost: totalCreditCost,
+      modelDisplayName: effectiveModelDisplay,
+      responseModel: convUsage?.latest?.responseModel || tr.modelId || '',
+    },
+    contextBreakdown: convUsage?.latest?.tokenBreakdown || null,
+  };
 
   const isEndedState = ['IDLE', 'COMPLETED', 'ERROR_STOPPED'].includes(health.state);
   const cascadeFullyStopped = Boolean(
@@ -795,7 +1498,7 @@ function buildConversationSnapshot(convId, psRows, now) {
     {
       stepCount: tr.stepCount,
       stepsSinceCompact: tr.stepsSinceCompact,
-      currentContext: tr.tokens.currentContext,
+      currentContext,
       compactCount: tr.compactCount,
     },
     userSettings,
@@ -811,6 +1514,7 @@ function buildConversationSnapshot(convId, psRows, now) {
     convId,
     hook.key,
     trEntry.key,
+    convUsage?.sig || '-',
     msEntry.key,
     health.state,
     health.badge,
@@ -829,12 +1533,34 @@ function buildConversationSnapshot(convId, psRows, now) {
     subagents.map((s) => s.key).join(','),
   ].join('|');
 
-  // Return newest 40 rounds in reverse chronological order for the Timeline tab
-  const timelineRounds = tr.rounds.slice(-40).reverse();
+  // Return newest 40 rounds in reverse chronological order for the Timeline tab,
+  // enriched with per-round API metrics (TTFT, decode TPS, cache hit rate, thinking tokens)
+  const byStep = convUsage?.byStepIndex || null;
+  const timelineRounds = tr.rounds.slice(-40).reverse().map((r) => {
+    if (!byStep || r.stepIndex == null) return r;
+    const am = byStep[r.stepIndex];
+    if (!am) return r;
+    return {
+      ...r,
+      apiMetrics: {
+        input: am.input,
+        cacheRead: am.cacheRead,
+        output: am.output,
+        cacheHitRate: am.cacheHitRate,
+        ttftMs: am.ttftMs,
+        streamMs: am.streamMs,
+        decodeTps: am.decodeTps,
+        thinkingOutput: am.thinkingOutput,
+        responseOutput: am.responseOutput,
+        cacheWrite: am.cacheWrite,
+        retries: am.retries,
+      },
+    };
+  });
 
   return {
     conversationId: convId,
-    found: Boolean(hook.data || tr.stepCount > 0 || runtimeMeta || msEntry.milestones),
+    found: Boolean(hook.data || tr.stepCount > 0 || runtimeMeta || msEntry.milestones || hasGenMeta),
     deleted: false,
     title: title || '当前会话',
     workspaceName,
@@ -859,13 +1585,33 @@ function buildConversationSnapshot(convId, psRows, now) {
     tokenSpeed: {
       ...tr.tokenSpeed,
       activeSubagentTpsSum: activeSubagentTpsSum || null,
+      decodeTps: convUsage?.totals?.decodeTps ?? null,
+      latestDecodeTps: convUsage?.latest?.decodeTps ?? null,
     },
     tokens: {
       ...tr.tokens,
+      currentContext,
+      input: mainInput,
+      cache: mainCacheRead,
+      cacheWrite: mainCacheWrite,
+      output: mainOutput,
+      thinkingOutput: mainThinkingOutput,
+      responseOutput: mainResponseOutput,
+      total: mainTotalTokens,
+      cacheHitRate: mainCacheHitRate,
+      grandCacheHitRate,
+      latestCacheHitRate,
+      maxContextTokens,
+      contextUsagePercent,
+      latestPromptBytes,
       subagentInput: subTokens.input,
+      subagentCache: subTokens.cache,
+      subagentCacheWrite: subTokens.cacheWrite,
       subagentOutput: subTokens.output,
-      grandTotalOutput: tr.tokens.output + subTokens.output,
+      grandTotalTokens,
+      grandTotalOutput: mainOutput + subTokens.output,
     },
+    metrics: sessionMetrics,
   };
 }
 
@@ -1120,7 +1866,32 @@ function copyToSystemClipboard(text) {
   });
 }
 
-const BACKEND_FILES = [join(__dirname, 'main.mjs'), join(__dirname, 'state_engine.mjs')];
+function flushDirtyStateSync() {
+  if (trafficDirty) {
+    saveTrafficLedgerSync(trafficLedger);
+    trafficLastSavedAt = Date.now();
+    trafficDirty = false;
+  }
+  if (globalUsageDirty) {
+    saveGlobalUsageCacheSync();
+    globalUsageLastSavedAt = Date.now();
+    globalUsageDirty = false;
+  }
+}
+
+for (const sigName of ['SIGTERM', 'SIGINT']) {
+  process.on(sigName, () => {
+    flushDirtyStateSync();
+    process.exit(0);
+  });
+}
+process.on('beforeExit', flushDirtyStateSync);
+
+const BACKEND_FILES = [
+  join(__dirname, 'main.mjs'),
+  join(__dirname, 'state_engine.mjs'),
+  join(__dirname, 'metrics_engine.mjs'),
+];
 const INITIAL_BACKEND_SIG = BACKEND_FILES.map((p) => {
   const st = statOf(p);
   return `${Math.round(st.mtime)}:${st.size}`;
@@ -1133,6 +1904,7 @@ const reloadWatchTimer = setInterval(() => {
   }).join('|');
   if (sig !== INITIAL_BACKEND_SIG) {
     console.log('[session-monitor] 检测到后端模块文件更新，主动退出以触发宿主热重载');
+    flushDirtyStateSync();
     process.exit(0);
   }
 }, 3000);
@@ -1176,8 +1948,18 @@ const handleStateRequest = async (data) => {
   const convId = ID_RE.test(rawConv) ? rawConv : '';
 
   const psRows = await refreshPsRows();
+  // 非阻塞触发配额刷新（60s TTL），同步异步采样 OS 网络流量（2.5s TTL）
+  triggerQuotaRefresh(now);
+  const network = await refreshNetworkTraffic(psRows, now);
   const current = buildConversationSnapshot(convId, psRows, now);
   const global = getGlobalSessions(psRows, now);
+  const globalUsage = buildGlobalUsageSnapshot(now);
+  const currentModelCandidates = [
+    current.metrics?.quality?.modelDisplayName,
+    current.metrics?.quality?.responseModel,
+    current.health?.modelName,
+  ].filter(Boolean);
+  const quota = parseUserStatusQuota(quotaCache.raw, currentModelCandidates);
   const activeCount = global.items.filter((it) => it.isActive).length;
   const attentionCount = global.items.filter(
     (it) => it.isActive && (it.severity === 'warning' || it.severity === 'danger' || it.severity === 'action_required'),
@@ -1185,7 +1967,30 @@ const handleStateRequest = async (data) => {
 
   const uiBuildKey = computeUiBuildKey();
   const settingsKey = JSON.stringify(userSettings);
-  const fullEtag = `${current.etagPart}||${global.key}||${settingsKey}||${uiBuildKey}`;
+  const netEtag = network.available
+    ? [
+      network.todayDate,
+      network.trackingSinceMs,
+      network.allTime.in,
+      network.allTime.out,
+      network.today.in,
+      network.today.out,
+      network.liveExternal.in,
+      network.liveExternal.out,
+      network.liveExternal.count,
+      network.liveExternal.proxyCount,
+      network.liveLoopback.total,
+      network.todayLoopback.total,
+      network.allTimeLoopback?.total ?? 0,
+      network.rates.inBps,
+      network.rates.outBps,
+    ].join(':')
+    : 'na';
+  const topTitleSig = (globalUsage.topSessions || []).map((s) => `${s.conversationId.slice(0, 8)}:${s.title}`).join(',');
+  const topTodayTitleSig = (globalUsage.topSessionsToday || []).map((s) => `${s.conversationId.slice(0, 8)}:${s.title}`).join(',');
+  const usageEtag = `${globalUsage.version}:${globalUsage.scanning ? 1 : 0}:${globalUsage.today.date}:${globalUsage.allTime.totalTokens}:${globalUsage.today.totalTokens}:${topTitleSig}|${topTodayTitleSig}`;
+  const quotaEtag = `${quotaCache.version}:${quota?.currentModelQuota?.remainingPercent ?? '-'}`;
+  const fullEtag = `${current.etagPart}||${global.key}||${netEtag}||${usageEtag}||${quotaEtag}||${settingsKey}||${uiBuildKey}`;
 
   if (data?.etag && data.etag === fullEtag) {
     return {
@@ -1205,6 +2010,9 @@ const handleStateRequest = async (data) => {
     conversationId: current.conversationId,
     settings: userSettings,
     current,
+    network,
+    globalUsage,
+    quota,
     global: {
       activeCount,
       attentionCount,
@@ -1214,6 +2022,31 @@ const handleStateRequest = async (data) => {
 };
 
 app.api('/api/state', handleStateRequest, 'GET');
+
+app.api('/api/traffic/reset', async () => {
+  trafficResetGen += 1;
+  let freshSample = null;
+  if (NETTOP_AVAILABLE) {
+    try {
+      const psRows = await refreshPsRows();
+      const res = await sampleNettopOnce(psRows, 1400);
+      if (res?.sample) {
+        freshSample = res.sample;
+        trafficCache.lastSample = freshSample;
+      }
+    } catch {
+      // 回落到保留既有高水位基线
+    }
+  }
+  const now = Date.now();
+  trafficLedger = resetTrafficLedger(trafficLedger, now, freshSample);
+  saveTrafficLedgerSync(trafficLedger);
+  trafficLastSavedAt = now;
+  trafficDirty = false;
+  trafficCache.at = now;
+  trafficCache.snapshot = buildNetworkSnapshot(trafficLedger, trafficCache.lastSample, now);
+  return { ok: true, network: trafficCache.snapshot };
+}, 'POST');
 
 app.api('/api/settings', (data) => {
   userSettings = saveSettings(data);
@@ -1303,4 +2136,7 @@ app.api('/api/compact', async (data) => {
 
 app.run().then(() => {
   console.log(`[session-monitor] 侧边栏服务已就绪 · 数据目录=${findAppDataDirs().join(',')}`);
+  // 启动后立即预热全机用量扫描与配额查询，缩短首屏展示等待
+  scheduleGlobalUsageScan(Date.now());
+  triggerQuotaRefresh(Date.now());
 });

@@ -3,6 +3,7 @@
  * 保持纯函数无副作用设计，便于通过 `node --test` 独立完成确定性单元测试。
  */
 import { basename } from 'node:path';
+import { computeCacheHitRate } from './metrics_engine.mjs';
 
 export const DEFAULT_SETTINGS = Object.freeze({
   notificationsEnabled: true,
@@ -512,7 +513,16 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null, r
     turnStartedAtMs: null,
     lastStepAtMs: transcriptMtimeMs || null,
     modelId: '',
-    tokens: { input: 0, cache: 0, output: 0, currentContext: 0 },
+    tokens: {
+      input: 0,
+      cache: 0,
+      output: 0,
+      currentContext: 0,
+      total: 0,
+      cacheHitRate: null,
+      latestCacheHitRate: null,
+    },
+    checkpointTokens: { input: 0, cache: 0, output: 0 },
     tokenSpeed: { ...EMPTY_TOKEN_SPEED },
     avgThinkingMs: null,
     rounds: [],
@@ -605,6 +615,9 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null, r
   let totalCache = 0;
   let totalOutput = 0;
   let currentContext = 0;
+  let latestCacheHitRate = null;
+  let modelId = '';
+  const checkpointTokens = { input: 0, cache: 0, output: 0 };
 
   const thinkingSamples = [];
   const rounds = [];
@@ -639,6 +652,12 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null, r
       compactCount += 1;
       lastCompactIdx = i;
       lastCompactAtMs = stMs || transcriptMtimeMs || null;
+      const cpIn = Number(st.input_tokens) || 0;
+      const cpCache = Number(st.cache_read_tokens) || 0;
+      const cpOut = Number(st.output_tokens) || 0;
+      checkpointTokens.input += cpIn;
+      checkpointTokens.cache += cpCache;
+      checkpointTokens.output += cpOut;
       // 压缩检查点落盘后，旧上下文已被折叠释放，重置当前活跃水位等待下一轮规划回报新值
       currentContext = 0;
       rounds.push({
@@ -652,6 +671,9 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null, r
         totalMs: 0,
         title: `已完成上下文压缩（第 ${compactCount} 次）`,
         tools: [],
+        tokens: (cpIn + cpCache + cpOut > 0)
+          ? { in: cpIn, cache: cpCache, out: cpOut, cacheHitRate: computeCacheHitRate(cpIn, cpCache) }
+          : null,
         inCurrentTurn: i > currentTurnAfterIdx,
       });
       continue;
@@ -701,10 +723,17 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null, r
     const inTok = Number(st.input_tokens) || 0;
     const cacheTok = Number(st.cache_read_tokens) || 0;
     const outTok = Number(st.output_tokens) || 0;
+    const roundCacheHitRate = computeCacheHitRate(inTok, cacheTok);
+    if (typeof st.model === 'string' && st.model.trim()) {
+      modelId = st.model.trim();
+    }
     totalInput += inTok;
     totalCache += cacheTok;
     totalOutput += outTok;
-    if (inTok + cacheTok > 0) currentContext = inTok + cacheTok;
+    if (inTok + cacheTok > 0) {
+      currentContext = inTok + cacheTok;
+      latestCacheHitRate = roundCacheHitRate;
+    }
 
     const rawCalls = Array.isArray(st.tool_calls) ? st.tool_calls : [];
     const describedCalls = rawCalls.map((tc) => describeToolCall(tc));
@@ -942,7 +971,7 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null, r
       title: roundTitle,
       hasReplyText: Boolean(typeof st.content === 'string' && st.content.trim()),
       tools: toolEntries,
-      tokens: { in: inTok, cache: cacheTok, out: outTok },
+      tokens: { in: inTok, cache: cacheTok, out: outTok, cacheHitRate: roundCacheHitRate },
       hasError: toolEntries.some((t) => t.status === 'ERROR'),
       inCurrentTurn: i > currentTurnAfterIdx,
     });
@@ -1064,12 +1093,17 @@ export function parseTranscript(text, transcriptMtimeMs = 0, hookState = null, r
     titleCandidate,
     turnStartedAtMs,
     lastStepAtMs: effectiveLastStepAtMs,
+    modelId,
     tokens: {
       input: totalInput,
       cache: totalCache,
       output: totalOutput,
       currentContext,
+      total: totalInput + totalCache + totalOutput,
+      cacheHitRate: computeCacheHitRate(totalInput, totalCache),
+      latestCacheHitRate,
     },
+    checkpointTokens,
     tokenSpeed,
     avgThinkingMs,
     rounds,
